@@ -19,7 +19,7 @@ use core::{
     num::NonZeroUsize,
     ops::Range,
 };
-
+use std::time::Instant;
 #[cfg(feature = "accesskit")]
 use crate::layout::LayoutAccessibility;
 #[cfg(feature = "accesskit")]
@@ -1204,6 +1204,7 @@ where
     }
     /// Update the layout.
     fn update_layout(&mut self, font_cx: &mut FontContext, layout_cx: &mut LayoutContext<T>) {
+        let start = Instant::now();
         let mut builder =
             layout_cx.ranged_builder(font_cx, &self.buffer, self.scale, self.quantize);
         for prop in self.default_style.inner().values() {
@@ -1216,6 +1217,8 @@ where
         self.layout.break_all_lines(self.width);
         self.layout
             .align(self.width, self.alignment, AlignmentOptions::default());
+        let elapsed = start.elapsed();
+        println!("total elapsed (layout only): {:?}", elapsed);
         self.selection = self.selection.refresh(&self.layout);
         self.layout_dirty = false;
         self.generation.nudge();

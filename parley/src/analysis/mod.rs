@@ -2,6 +2,7 @@ pub(crate) mod cluster;
 
 use std::collections::HashMap;
 use std::marker::PhantomData;
+use std::time::Instant;
 use icu::collections::codepointtrie::TrieValue;
 use icu::segmenter::{GraphemeClusterSegmenter, GraphemeClusterSegmenterBorrowed, LineSegmenter, LineSegmenterBorrowed, WordSegmenter, WordSegmenterBorrowed};
 use icu::segmenter::options::{LineBreakOptions, LineBreakWordOption, WordBreakInvariantOptions};
@@ -335,9 +336,18 @@ pub(crate) fn analyze_text<B: Brush>(lcx: &mut LayoutContext<B>, text: &str) {
     }
 
     let text = if text.is_empty() { " " } else { text };
-    let mut a = swash::text::analyze(text.chars());
-    _ = analyze_text_icu(lcx, text);
 
+
+    let start = Instant::now();
+    _ = analyze_text_icu(lcx, text);
+    let elapsed = start.elapsed();
+    println!("analyze_text_icu took: {} ms ({} μs)",
+             elapsed.as_millis(),
+             elapsed.as_micros()
+    );
+
+    let start = Instant::now();
+    let mut a = swash::text::analyze(text.chars());
     let mut word_break = Default::default();
     let mut style_idx = 0;
 
@@ -366,14 +376,22 @@ pub(crate) fn analyze_text<B: Brush>(lcx: &mut LayoutContext<B>, text: &str) {
     }
 
     // TODO(conor) - add back later, this is just to bring swash/icu test data to parity
-    //if a.needs_bidi_resolution() {
+    if a.needs_bidi_resolution() {
     lcx.bidi.resolve(
         text.chars()
             .zip(lcx.info.iter().map(|info| info.0.bidi_class())),
         None,
     );
-    println!("{:?}", lcx.bidi.levels());
-    //}
+    //println!("{:?}", lcx.bidi.levels());
+    }
+
+    let elapsed_swash = start.elapsed();
+    println!("swash analyse took: {} ms ({} μs)",
+             elapsed_swash.as_millis(),
+             elapsed_swash.as_micros()
+    );
+
+    println!("==");
 }
 
 #[cfg(test)]
@@ -417,16 +435,16 @@ mod tests {
             swash_iter.zip(bidi_iter).zip(icu_iter).enumerate() {
 
             // Print comparison for debugging
-            println!(
-                "[Char {}] SWASH vs ICU4X - boundary: {:?} vs {:?}, bidi: {:?} vs {:?}, script: {:?} vs {:?}",
-                idx,
-                swash_info.boundary(),
-                icu_info.boundary,
-                bidi_level,  // SWASH bidi level
-                icu_info.bidi_embed_level,  // ICU4X bidi level
-                swash_info.script(),
-                crate::swash_convert::script_icu_to_swash(icu_info.script), // TODO(conor)
-            );
+            //println!(
+            //     "[Char {}] SWASH vs ICU4X - boundary: {:?} vs {:?}, bidi: {:?} vs {:?}, script: {:?} vs {:?}",
+            //     idx,
+            //     swash_info.boundary(),
+            //     icu_info.boundary,
+            //     bidi_level,  // SWASH bidi level
+            //     icu_info.bidi_embed_level,  // ICU4X bidi level
+            //     swash_info.script(),
+            //     crate::swash_convert::script_icu_to_swash(icu_info.script), // TODO(conor)
+            // );
 
             // Assert equality
             assert_eq!(
