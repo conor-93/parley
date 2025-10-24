@@ -1,18 +1,21 @@
 pub(crate) mod cluster;
 mod provider;
 
-use std::collections::HashMap;
 use std::marker::PhantomData;
 use icu_collections::codepointtrie::TrieValue;
 use icu_normalizer::{ComposingNormalizer, ComposingNormalizerBorrowed, DecomposingNormalizer, DecomposingNormalizerBorrowed};
 use icu_properties::{CodePointMapData, CodePointMapDataBorrowed, CodePointSetData, CodePointSetDataBorrowed, EmojiSetData, EmojiSetDataBorrowed};
 use icu_properties::props::{BasicEmoji, BidiClass, Emoji, ExtendedPictographic, GeneralCategory, GraphemeClusterBreak, LineBreak, RegionalIndicator, Script, VariationSelector};
+use icu_provider::{DataRequest, DataResponse, DynamicDataProvider};
 use icu_segmenter::{GraphemeClusterSegmenter, GraphemeClusterSegmenterBorrowed, LineSegmenter, LineSegmenterBorrowed, WordSegmenter, WordSegmenterBorrowed};
 use icu_segmenter::options::{LineBreakOptions, LineBreakWordOption, WordBreakOptions};
 use unicode_bidi::TextSource;
 use crate::{Brush, LayoutContext};
-use crate::analysis::provider::PROVIDER;
+use crate::analysis::provider::{COMPOSITE_BLOB, PROVIDER};
 use crate::resolve::RangedStyle;
+use icu_provider::buf::AsDeserializingBufferProvider;
+use icu_provider::DataMarker;
+use composite_props_marker::{CompositePropsV1, CompositePropsV1Data};
 
 pub(crate) struct AnalysisDataSources {
     grapheme_segmenter: GraphemeClusterSegmenter,
@@ -21,19 +24,52 @@ pub(crate) struct AnalysisDataSources {
     emoji: CodePointSetData,
     extended_pictographic: CodePointSetData,
     regional_indicator: CodePointSetData,
-    script: CodePointMapData<Script>,
-    general_category: CodePointMapData<GeneralCategory>,
     bidi_class: CodePointMapData<BidiClass>,
-    line_break: CodePointMapData<LineBreak>,
-    grapheme_cluster_break: CodePointMapData<GraphemeClusterBreak>,
     word_segmenter: WordSegmenter,
-    line_segmenters: HashMap<u8, LineSegmenter>,
+    line_segmenters: LineSegmenters,
     composing_normalizer: ComposingNormalizer,
     decomposing_normalizer: DecomposingNormalizer,
+
+    composite: DataResponse<CompositePropsV1>,
+}
+
+#[derive(Default)]
+struct LineSegmenters {
+    normal: Option<LineSegmenter>,
+    keep_all: Option<LineSegmenter>,
+    break_all: Option<LineSegmenter>
+}
+
+impl LineSegmenters {
+    fn get(&mut self, word_break_strength: LineBreakWordOption) -> LineSegmenterBorrowed<'_> {
+        let segmenter = match word_break_strength {
+            LineBreakWordOption::Normal => &mut self.normal,
+            LineBreakWordOption::KeepAll => &mut self.keep_all,
+            LineBreakWordOption::BreakAll => &mut self.break_all,
+            _ => unreachable!(),
+        };
+
+        segmenter
+            .get_or_insert_with(|| {
+                let mut line_break_opts = LineBreakOptions::default();
+                line_break_opts.word_option = Some(word_break_strength);
+                LineSegmenter::try_new_auto_unstable(&PROVIDER, line_break_opts)
+                    .expect("Failed to create LineSegmenter")
+            })
+            .as_borrowed()
+    }
 }
 
 impl AnalysisDataSources {
     pub(crate) fn new() -> Self {
+        let blob = icu_provider_blob::BlobDataProvider::try_new_from_static_blob(COMPOSITE_BLOB).unwrap();
+        //let composite_props = blob.load_data(CompositePropsV1::INFO, DataRequest::default()).unwrap();
+        // Convert blob (BufferProvider) to a typed DataProvider via deserialization:
+        let dp = blob.as_deserializing();
+
+        // Load typed data:
+        let composite: DataResponse<CompositePropsV1> = dp.load_data(CompositePropsV1::INFO, DataRequest::default()).unwrap();
+
         Self {
             grapheme_segmenter: GraphemeClusterSegmenter::try_new_unstable(&PROVIDER).unwrap(),
             variation_selector: CodePointSetData::try_new_unstable::<VariationSelector>(&PROVIDER).unwrap(),
@@ -41,16 +77,17 @@ impl AnalysisDataSources {
             emoji: CodePointSetData::try_new_unstable::<Emoji>(&PROVIDER).unwrap(),
             extended_pictographic: CodePointSetData::try_new_unstable::<ExtendedPictographic>(&PROVIDER).unwrap(),
             regional_indicator: CodePointSetData::try_new_unstable::<RegionalIndicator>(&PROVIDER).unwrap(),
-            script: CodePointMapData::<Script>::try_new_unstable(&PROVIDER).unwrap(),
-            general_category: CodePointMapData::<GeneralCategory>::try_new_unstable(&PROVIDER).unwrap(),
             bidi_class: CodePointMapData::<BidiClass>::try_new_unstable(&PROVIDER).unwrap(),
-            line_break: CodePointMapData::<LineBreak>::try_new_unstable(&PROVIDER).unwrap(),
-            grapheme_cluster_break: CodePointMapData::<GraphemeClusterBreak>::try_new_unstable(&PROVIDER).unwrap(),
             word_segmenter: WordSegmenter::try_new_auto_unstable(&PROVIDER, WordBreakOptions::default()).unwrap(),
-            line_segmenters: HashMap::new(),
+            line_segmenters: LineSegmenters::default(),
             composing_normalizer: ComposingNormalizer::try_new_nfc_unstable(&PROVIDER).unwrap(),
             decomposing_normalizer: DecomposingNormalizer::try_new_nfd_unstable(&PROVIDER).unwrap(),
+            composite: composite,
         }
+    }
+
+    pub(crate) fn composite(&self) -> &CompositePropsV1Data<'_> {
+        self.composite.payload.get()
     }
 
     pub(crate) fn grapheme_segmenter(&self) -> GraphemeClusterSegmenterBorrowed<'_> {
@@ -77,36 +114,12 @@ impl AnalysisDataSources {
         self.regional_indicator.as_borrowed()
     }
 
-    fn script(&self) -> CodePointMapDataBorrowed<'_, Script> {
-        self.script.as_borrowed()
-    }
-
-    fn general_category(&self) -> CodePointMapDataBorrowed<'_, GeneralCategory> {
-        self.general_category.as_borrowed()
-    }
-
     fn bidi_class(&self) -> CodePointMapDataBorrowed<'_, BidiClass> {
         self.bidi_class.as_borrowed()
     }
 
-    fn line_break(&self) -> CodePointMapDataBorrowed<'_, LineBreak> {
-        self.line_break.as_borrowed()
-    }
-
-    fn grapheme_cluster_break(&self) -> CodePointMapDataBorrowed<'_, GraphemeClusterBreak> {
-        self.grapheme_cluster_break.as_borrowed()
-    }
-
     fn word_segmenter(&self) -> WordSegmenterBorrowed<'_> {
         self.word_segmenter.as_borrowed()
-    }
-
-    fn line_segmenter(&mut self, word_break_strength: LineBreakWordOption) -> LineSegmenterBorrowed<'_> {
-        self.line_segmenters.entry(word_break_strength as u8).or_insert({
-            let mut line_break_opts: LineBreakOptions<'static> = Default::default();
-            line_break_opts.word_option = Some(word_break_strength);
-            LineSegmenter::try_new_auto_unstable(&PROVIDER, line_break_opts).unwrap()
-        }).as_borrowed()
     }
 
     fn composing_normalizer(&self) -> ComposingNormalizerBorrowed<'_> {
@@ -132,6 +145,8 @@ pub(crate) struct CharInfo {
     pub grapheme_cluster_break: GraphemeClusterBreak,
     /// Whether this character belongs to the "Control" general category in Unicode.
     pub is_control: bool,
+
+    pub is_emoji_or_pictograph: bool,
     /// Whether this character contributes to text shaping in Parley.
     pub contributes_to_shaping: bool,
     /// Whether to apply NFC normalization before attempting cluster form variations during
@@ -154,19 +169,11 @@ pub(crate) enum Boundary {
 }
 
 pub(crate) fn analyze_text<B: Brush>(lcx: &mut LayoutContext<B>, text: &str) {
-    // See: https://github.com/unicode-org/icu4x/blob/ee5399a77a6b94efb5d4b60678bb458c5eedb25d/components/segmenter/src/line.rs#L338-L351
-    fn is_mandatory_line_break(line_break: LineBreak) -> bool {
-        matches!(line_break, LineBreak::MandatoryBreak
-                | LineBreak::CarriageReturn
-                | LineBreak::LineFeed
-                | LineBreak::NextLine)
-    }
-
     struct WordBreakSegmentIter<'a, I: Iterator, B: Brush> {
         text: &'a str,
         styles: I,
         char_indices: std::str::CharIndices<'a>,
-        current_char_index: usize,
+        current_char: (usize, char),
         building_range_start: usize,
         previous_word_break_style: LineBreakWordOption,
         done: bool,
@@ -183,13 +190,13 @@ pub(crate) fn analyze_text<B: Brush>(lcx: &mut LayoutContext<B>, text: &str) {
             first_style: &RangedStyle<B>
         ) -> Self {
             let mut char_indices = text.char_indices();
-            let current_char_len = char_indices.next().unwrap().0;
+            let current_char_len = char_indices.next().unwrap();
 
             Self {
                 text,
                 styles,
                 char_indices,
-                current_char_index: current_char_len,
+                current_char: current_char_len,
                 building_range_start: first_style.range.start,
                 previous_word_break_style: first_style.style.word_break,
                 done: false,
@@ -210,62 +217,56 @@ pub(crate) fn analyze_text<B: Brush>(lcx: &mut LayoutContext<B>, text: &str) {
             }
 
             while let Some(style) = self.styles.next() {
+                assert!(style.range.start < style.range.end);
                 let style_start_index = style.range.start;
-                if style_start_index == style.range.end {
-                    // Skip empty style ranges
-                    continue;
-                }
-                let mut prev_char_index = self.current_char_index;
+                let mut prev_char_index = self.current_char;
 
                 // Find the character at the style boundary
-                while self.current_char_index < style_start_index {
-                    prev_char_index = self.current_char_index;
-                    self.current_char_index = self.char_indices.next().unwrap().0;
+                while self.current_char.0 < style_start_index {
+                    prev_char_index = self.current_char;
+                    self.current_char = self.char_indices.next().unwrap();
                 }
 
                 let current_word_break_style = style.style.word_break;
-                // Produce one substring for each different word break style run
-                if self.previous_word_break_style != current_word_break_style {
-                    let (_, prev_size) = self.text.char_at(prev_char_index).unwrap();
-                    let (_, size) = self.text.char_at(style_start_index).unwrap();
-
-                    let substring = self.text.subrange(
-                        self.building_range_start..style_start_index + size
-                    );
-                    let result_style = self.previous_word_break_style;
-
-                    self.building_range_start = style_start_index - prev_size;
-                    self.previous_word_break_style = current_word_break_style;
-
-                    return Some((substring, result_style, false));
+                if self.previous_word_break_style == current_word_break_style {
+                    continue;
                 }
 
+                // Produce one substring for each different word break style run
+                let prev_size = prev_char_index.1.len_utf8();
+                let size = self.current_char.1.len_utf8();
+
+                let substring = self.text.subrange(
+                    self.building_range_start..style_start_index + size
+                );
+                let result_style = self.previous_word_break_style;
+
+                self.building_range_start = style_start_index - prev_size;
                 self.previous_word_break_style = current_word_break_style;
+
+                return Some((substring, result_style, false));
             }
 
             // Final segment
             self.done = true;
-            let last_substring = if self.building_range_start == 0 {
-                self.text
-            } else {
-                self.text.subrange(self.building_range_start..self.text.len())
-            };
+            let last_substring = self.text.subrange(self.building_range_start..self.text.len());
             Some((last_substring, self.previous_word_break_style, true))
         }
     }
 
     let text = if text.is_empty() { " " } else { text };
+    
+    let mut line_segmenters = core::mem::take(&mut lcx.analysis_data_sources.line_segmenters);
 
-    let mut all_boundaries_byte_indexed = vec![Boundary::None; text.len()];
-
-    // Word boundaries:
-    for wb in lcx.analysis_data_sources.word_segmenter().segment_str(text) {
+    // Collect boundary byte positions compactly
+    let mut wb_iter =  lcx.analysis_data_sources.word_segmenter().segment_str(text).filter_map(|wb| {
         // icu produces a word boundary trailing the string, which we don't use.
         if wb == text.len() {
-            continue;
+            None
+        } else {
+            Some(wb)
         }
-        all_boundaries_byte_indexed[wb] = Boundary::Word;
-    }
+    }).peekable();
 
     // Line boundaries (word break naming refers to the line boundary determination config).
     //
@@ -274,32 +275,42 @@ pub(crate) fn analyze_text<B: Brush>(lcx: &mut LayoutContext<B>, text: &str) {
     let Some((first_style, rest)) = lcx.styles.split_first() else {
         panic!("No style info");
     };
+
     let contiguous_word_break_substrings = WordBreakSegmentIter::new(
         text,
         rest.iter(),
         &first_style
     );
     let mut global_offset = 0;
+    let mut line_boundary_positions: Vec<usize> = Vec::new();
+    // LINE BOUNDARIES COLLECTION
     for (substring_index, (substring, word_break_strength, last)) in contiguous_word_break_substrings.enumerate() {
-        let line_boundaries: Vec<usize> = lcx.analysis_data_sources
-            .line_segmenter(word_break_strength)
-            .segment_str(substring)
-            .collect();
-
         // Fast path for text with a single word-break option.
         if substring_index == 0 && last {
-            // icu adds leading and trailing line boundaries, which we don't use.
-            let Some((_first, rest)) = line_boundaries.split_first() else {
+            let mut lb_iter = line_segmenters.get(word_break_strength).segment_str(substring);
+
+            let _first = lb_iter.next();
+            let second = lb_iter.next();
+
+            if second.is_none() {
                 continue;
-            };
-            let Some((_last, middle)) = rest.split_last() else {
-                continue;
-            };
-            for &b in middle {
-                all_boundaries_byte_indexed[b] = Boundary::Line;
             }
+
+            let third = lb_iter.next();
+
+            if third.is_none() {
+                continue;
+            }
+
+            let iter = [second.unwrap(), third.unwrap()].into_iter().chain(lb_iter);
+
+            line_boundary_positions.extend(iter);
+            // Remove the unnescessary boundary added by ICU4X.
+            line_boundary_positions.pop();
             break;
         }
+
+        let line_boundaries_iter = line_segmenters.get(word_break_strength).segment_str(substring);
 
         let mut substring_chars = substring.chars();
         if substring_index != 0 {
@@ -310,9 +321,9 @@ pub(crate) fn analyze_text<B: Brush>(lcx: &mut LayoutContext<B>, text: &str) {
         let last_len = substring_chars.next_back().unwrap().len_utf8();
 
         // Mark line boundaries (overriding word boundaries where present).
-        for (index, &pos) in line_boundaries.iter().enumerate() {
+        for (index, pos) in line_boundaries_iter.enumerate() {
             // icu adds leading and trailing line boundaries, which we don't use.
-            if index == 0 || index == line_boundaries.len() - 1 {
+            if index == 0 || pos == substring.len() {
                 continue;
             }
 
@@ -322,7 +333,7 @@ pub(crate) fn analyze_text<B: Brush>(lcx: &mut LayoutContext<B>, text: &str) {
             if !last && pos == substring.len() - last_len {
                 continue;
             }
-            all_boundaries_byte_indexed[pos + global_offset] = Boundary::Line;
+            line_boundary_positions.push(pos + global_offset);
         }
 
         if !last {
@@ -333,11 +344,35 @@ pub(crate) fn analyze_text<B: Brush>(lcx: &mut LayoutContext<B>, text: &str) {
     // BiDi embedding levels:
     let bidi_embedding_levels = unicode_bidi::BidiInfo::new_with_data_source(&lcx.analysis_data_sources.bidi_class(), text, None).levels;
 
+    // Merge boundaries - line takes precedence over word
+    let mut lb_iter = line_boundary_positions.iter().peekable();
     let boundaries_and_levels_iter = text.char_indices()
-        .map(|(byte_pos, _)| (
-            all_boundaries_byte_indexed.get(byte_pos).unwrap(),
-            bidi_embedding_levels.get(byte_pos).unwrap()
-        ));
+        .map(|(byte_pos, _)| {
+            // advance any stale word boundary positions
+            while let Some(&w) = wb_iter.peek() {
+                if w < byte_pos { _ = wb_iter.next(); } else { break; }
+            }
+            // advance any stale line boundary positions
+            while let Some(&l) = lb_iter.peek() {
+                if *l < byte_pos { _ = lb_iter.next(); } else { break; }
+            }
+
+            let mut boundary = Boundary::None;
+            if let Some(&w) = wb_iter.peek() {
+                if w == byte_pos {
+                    boundary = Boundary::Word;
+                    _ = wb_iter.next();
+                }
+            }
+            if let Some(&l) = lb_iter.peek() {
+                if *l == byte_pos {
+                    boundary = Boundary::Line;
+                    _ = lb_iter.next();
+                }
+            }
+
+            (boundary, bidi_embedding_levels.get(byte_pos).unwrap())
+        });
 
     fn unicode_data_iterator<'a, T: TrieValue>(
         text: &'a str,
@@ -346,23 +381,28 @@ pub(crate) fn analyze_text<B: Brush>(lcx: &mut LayoutContext<B>, text: &str) {
         text.chars().map(move |c| data_source.get32(c as u32))
     }
 
+    let composite = lcx.analysis_data_sources.composite();
+
     boundaries_and_levels_iter
         .zip(text.chars())
-        .zip(unicode_data_iterator(text, lcx.analysis_data_sources.script()))
-        .zip(unicode_data_iterator(text, lcx.analysis_data_sources.general_category()))
-        .zip(unicode_data_iterator(text, lcx.analysis_data_sources.grapheme_cluster_break()))
         // Shift line break data forward one, as line boundaries corresponding with line-breaking
         // characters (like '\n') exist at an index position one higher than the respective
         // character's index, but we need our iterators to align, and the rest are simply
         // character-indexed.
-        .zip(std::iter::once(LineBreak::from_icu4c_value(0)).chain(unicode_data_iterator(text, lcx.analysis_data_sources.line_break())))
-        .for_each(|((((((boundary, embed_level), ch), script), general_category), grapheme_cluster_break), line_break)| {
+        // TODO: This isn't quite correct.
+        //.zip(std::iter::once(LineBreak::from_icu4c_value(0)).chain(unicode_data_iterator(text, lcx.analysis_data_sources.line_break())))
+        .for_each(|((boundary, embed_level), ch)| {
+            let composite_data = composite.trie.get32(ch as u32);
+            let grapheme_cluster_break = composite_props_marker::unpack::grapheme_cluster_break(composite_data);
+            let general_category = composite_props_marker::unpack::general_category(composite_data);
+            let script = composite_props_marker::unpack::script(composite_data);
+            let is_emoji_or_pictograph = composite_props_marker::unpack::is_emoji_or_pictograph(composite_data);
             let bidi_embed_level: BidiLevel = (*embed_level).into();
 
-            let boundary = if is_mandatory_line_break(line_break) {
+            let boundary = if composite_props_marker::unpack::is_mandatory_linebreak(composite_data) {
                 Boundary::Mandatory
             } else {
-                *boundary
+                boundary
             };
 
             let is_control = matches!(general_category, GeneralCategory::Control);
@@ -388,12 +428,16 @@ pub(crate) fn analyze_text<B: Brush>(lcx: &mut LayoutContext<B>, text: &str) {
                     script,
                     grapheme_cluster_break,
                     is_control,
+                    is_emoji_or_pictograph,
                     contributes_to_shaping,
                     force_normalize
                 },
                 0 // Style index is populated later
             ));
         });
+
+    // Restore line segmenters
+    lcx.analysis_data_sources.line_segmenters = line_segmenters;
 }
 
 #[cfg(test)]
