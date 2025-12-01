@@ -293,6 +293,68 @@ pub(crate) struct LayoutData<B: Brush> {
     pub(crate) alignment_width: f32,
 }
 
+/// Represents a contiguous range of unshaped clusters (glyphs with id 0) that need
+/// to be reshaped with a fallback font.
+#[derive(Clone, Debug)]
+pub(crate) struct Hole {
+    /// Char index range within the segment's char_infos slice.
+    /// Used to extract the CharInfo slice for reshaping.
+    pub char_range: Range<usize>,
+    /// Text byte range within the segment text.
+    /// Used to extract the substring for reshaping.
+    pub text_range: Range<usize>,
+}
+
+/// A segment of shaped text, either successfully shaped or a hole needing fallback.
+#[derive(Clone, Debug)]
+pub(crate) enum ShapedSegment {
+    /// Successfully shaped - glyphs are valid
+    Shaped {
+        /// Cluster index range (0-based within this shaping result)
+        cluster_range: Range<usize>,
+        /// Text byte range within the shaped text
+        text_range: Range<usize>,
+    },
+    /// A hole - glyphs have glyph_id == 0, needs fallback font
+    Hole(Hole),
+}
+
+/// Result of analyzing a glyph buffer for holes.
+/// Contains alternating shaped and hole segments in text order.
+#[derive(Clone, Debug)]
+pub(crate) struct ShapedRunAnalysis {
+    /// Segments in logical (text) order
+    pub segments: Vec<ShapedSegment>,
+    /// Whether any holes were found
+    pub has_holes: bool,
+}
+
+/// Temporarily holds processed cluster/glyph data before deciding whether to push to layout.
+/// This allows us to analyze for holes and then either push entirely or split by segments.
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) struct ProcessedRun {
+    /// Processed clusters (in logical order)
+    pub clusters: Vec<ClusterData>,
+    /// Processed glyphs
+    pub glyphs: Vec<Glyph>,
+    /// Total advance of the run
+    pub advance: f32,
+    /// Run metrics
+    pub metrics: RunMetrics,
+    /// Font data for this run
+    pub font_index: usize,
+    pub font_size: f32,
+    pub synthesis: fontique::Synthesis,
+    pub coords: Vec<i16>,
+    /// Text info
+    pub bidi_level: u8,
+    pub style_index: u16,
+    pub word_spacing: f32,
+    pub letter_spacing: f32,
+    pub text_range: Range<usize>,
+}
+
 impl<B: Brush> Default for LayoutData<B> {
     fn default() -> Self {
         Self {
@@ -352,7 +414,32 @@ impl<B: Brush> LayoutData<B> {
             bidi_level,
         });
     }
+
+    // So the plan is:
+    // 1. Shape the text without font selection
+    // 2. If in layout analysis, we find holes (as determined by 0 glyph IDs), we:
+    //      - If not empty, push the current state as a run
+    //      - If there's more to process, push the current iterative state to a stack
+    //          - Maybe just a reference to the original run + per-glyph-iterators
+    //  3. Repeat from 1 until stack is empty, but where non-first iterations:
+    //      - Keep track of total advance to push glyphs accordingly
+    //
+    //
+    // Questions:
+    // - How do we offset the glyphs that were positioned after some hole? Maybe it's as simple
+    // as tracking the total advance, which we already do. We could add it to the run.
+
+    // Invariants useful for shaper based itemisation:
+    // - char_infos len is the total width of the clusters
+
+    /// Push a shaped run to the layout.
+    ///
+    /// Returns a list of holes (ranges with glyph_id == 0) that need to be
+    /// reshaped with fallback fonts. If the list is empty, the entire run
+    /// was successfully shaped.
+    /// Push a run directly from a glyph buffer (legacy method, kept for reference).
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
     pub(crate) fn push_run(
         &mut self,
         font: FontData,
@@ -367,7 +454,7 @@ impl<B: Brush> LayoutData<B> {
         char_infos: &[(CharInfo, u16)], // From text analysis
         text_range: Range<usize>,       // The text range this run covers
         coords: &[harfrust::NormalizedCoord],
-    ) {
+    ) -> Vec<Hole> {
         let coords_start = self.coords.len();
         self.coords.extend(coords.iter().map(|c| c.to_bits()));
         let coords_end = self.coords.len();
@@ -449,14 +536,15 @@ impl<B: Brush> LayoutData<B> {
 
         let glyph_infos = glyph_buffer.glyph_infos();
         if glyph_infos.is_empty() {
-            return;
+            return Vec::new();
         }
         let glyph_positions = glyph_buffer.glyph_positions();
         let scale_factor = font_size / units_per_em;
         let cluster_range_start = self.clusters.len();
         let is_rtl = bidi_level & 1 == 1;
+        let glyph_start = self.glyphs.len();
         if !is_rtl {
-            run.advance = process_clusters(
+            let advance = process_clusters(
                 Direction::Ltr,
                 &mut self.clusters,
                 &mut self.glyphs,
@@ -466,8 +554,9 @@ impl<B: Brush> LayoutData<B> {
                 char_infos,
                 source_text.char_indices(),
             );
+            run.advance = advance;
         } else {
-            run.advance = process_clusters(
+            let advance = process_clusters(
                 Direction::Rtl,
                 &mut self.clusters,
                 &mut self.glyphs,
@@ -477,12 +566,22 @@ impl<B: Brush> LayoutData<B> {
                 char_infos,
                 source_text.char_indices().rev(),
             );
+            run.advance = advance;
             // Reverse clusters into logical order for RTL
             let clusters_len = self.clusters.len();
             self.clusters[cluster_range_start..clusters_len].reverse();
-        }
+        };
 
         run.cluster_range = cluster_range_start..self.clusters.len();
+        assert_eq!(run.cluster_range.len(), char_infos.len());
+
+        // Detect holes (clusters with glyph_id == 0) now that clusters are in logical order.
+        // This works correctly for both LTR and RTL since clusters are already normalized.
+        let holes = detect_holes(
+            &self.clusters[run.cluster_range.clone()],
+            &self.glyphs[glyph_start..],
+        );
+
         if !run.cluster_range.is_empty() {
             self.runs.push(run);
             self.items.push(LayoutItem {
@@ -491,6 +590,321 @@ impl<B: Brush> LayoutData<B> {
                 bidi_level,
             });
         }
+
+        holes
+    }
+
+    /// Remove the last pushed run along with its clusters and glyphs.
+    /// Used when a run has holes and needs to be re-shaped with fallback fonts.
+    #[allow(dead_code)]
+    pub(crate) fn undo_last_run(&mut self) {
+        // Remove the last item (should be a TextRun)
+        if let Some(last_item) = self.items.pop() {
+            debug_assert_eq!(last_item.kind, LayoutItemKind::TextRun);
+        }
+
+        // Remove the last run and its associated data
+        if let Some(run) = self.runs.pop() {
+            // Remove clusters for this run
+            self.clusters.truncate(run.cluster_range.start);
+            // Remove glyphs for this run
+            self.glyphs.truncate(run.glyph_start);
+            // Remove coords for this run
+            self.coords.truncate(run.coords_range.start);
+        }
+    }
+
+    /// Process a glyph buffer into a `ProcessedRun` WITHOUT pushing to layout.
+    /// This allows analyzing for holes before deciding how to push.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn process_run_to_temp(
+        &mut self,
+        font: FontData,
+        font_size: f32,
+        synthesis: fontique::Synthesis,
+        glyph_buffer: &harfrust::GlyphBuffer,
+        bidi_level: u8,
+        style_index: u16,
+        word_spacing: f32,
+        letter_spacing: f32,
+        source_text: &str,
+        char_infos: &[(CharInfo, u16)],
+        text_range: Range<usize>,
+        coords: &[harfrust::NormalizedCoord],
+    ) -> ProcessedRun {
+        let coords_vec: Vec<i16> = coords.iter().map(|c| c.to_bits()).collect();
+
+        let font_index = self
+            .fonts
+            .iter()
+            .position(|f| *f == font)
+            .unwrap_or_else(|| {
+                let index = self.fonts.len();
+                self.fonts.push(font);
+                index
+            });
+
+        let metrics = {
+            let font = &self.fonts[font_index];
+            let font_ref = skrifa::FontRef::from_index(font.data.as_ref(), font.index).unwrap();
+            skrifa::metrics::Metrics::new(&font_ref, skrifa::prelude::Size::new(font_size), coords)
+        };
+        let units_per_em = metrics.units_per_em as f32;
+
+        let run_metrics = {
+            let (underline_offset, underline_size) = if let Some(underline) = metrics.underline {
+                (underline.offset, underline.thickness)
+            } else {
+                let default = units_per_em / 18.0;
+                (default, default)
+            };
+            let (strikethrough_offset, strikethrough_size) =
+                if let Some(strikeout) = metrics.strikeout {
+                    (strikeout.offset, strikeout.thickness)
+                } else {
+                    (metrics.ascent / 2.0, units_per_em / 18.0)
+                };
+
+            let style = &self.styles[style_index as usize];
+            let line_height = match style.line_height {
+                LineHeight::Absolute(value) => value,
+                LineHeight::FontSizeRelative(value) => value * font_size,
+                LineHeight::MetricsRelative(value) => {
+                    (metrics.ascent - metrics.descent + metrics.leading) * value
+                }
+            };
+
+            RunMetrics {
+                ascent: metrics.ascent,
+                descent: -metrics.descent,
+                leading: metrics.leading,
+                underline_offset,
+                underline_size,
+                strikethrough_offset,
+                strikethrough_size,
+                line_height,
+            }
+        };
+
+        let glyph_infos = glyph_buffer.glyph_infos();
+        if glyph_infos.is_empty() {
+            return ProcessedRun {
+                clusters: Vec::new(),
+                glyphs: Vec::new(),
+                advance: 0.0,
+                metrics: run_metrics,
+                font_index,
+                font_size,
+                synthesis,
+                coords: coords_vec,
+                bidi_level,
+                style_index,
+                word_spacing,
+                letter_spacing,
+                text_range,
+            };
+        }
+
+        let glyph_positions = glyph_buffer.glyph_positions();
+        let scale_factor = font_size / units_per_em;
+        let is_rtl = bidi_level & 1 == 1;
+
+        let mut clusters = Vec::new();
+        let mut glyphs = Vec::new();
+
+        let advance = if !is_rtl {
+            process_clusters(
+                Direction::Ltr,
+                &mut clusters,
+                &mut glyphs,
+                scale_factor,
+                glyph_infos,
+                glyph_positions,
+                char_infos,
+                source_text.char_indices(),
+            )
+        } else {
+            let advance = process_clusters(
+                Direction::Rtl,
+                &mut clusters,
+                &mut glyphs,
+                scale_factor,
+                glyph_infos,
+                glyph_positions,
+                char_infos,
+                source_text.char_indices().rev(),
+            );
+            // Reverse clusters into logical order for RTL
+            clusters.reverse();
+            advance
+        };
+
+        ProcessedRun {
+            clusters,
+            glyphs,
+            advance,
+            metrics: run_metrics,
+            font_index,
+            font_size,
+            synthesis,
+            coords: coords_vec,
+            bidi_level,
+            style_index,
+            word_spacing,
+            letter_spacing,
+            text_range,
+        }
+    }
+
+    /// Analyzes a glyph buffer and returns segments (shaped vs holes) in text order.
+    /// This is used to split shaped data for hole-based font fallback.
+    pub(crate) fn analyze_processed_run(run: &ProcessedRun, text_len: usize) -> ShapedRunAnalysis {
+        let clusters = &run.clusters;
+        let glyphs = &run.glyphs;
+        let holes = detect_holes(clusters, glyphs);
+
+        if holes.is_empty() {
+            // No holes - everything is shaped
+            return ShapedRunAnalysis {
+                segments: vec![ShapedSegment::Shaped {
+                    cluster_range: 0..clusters.len(),
+                    text_range: 0..text_len,
+                }],
+                has_holes: false,
+            };
+        }
+
+        // Build segments from holes
+        let mut segments = Vec::new();
+        let mut last_end_cluster = 0;
+        let mut last_end_text = 0;
+
+        for hole in holes {
+            // Add shaped segment before this hole (if any)
+            if hole.char_range.start > last_end_cluster {
+                segments.push(ShapedSegment::Shaped {
+                    cluster_range: last_end_cluster..hole.char_range.start,
+                    text_range: last_end_text..hole.text_range.start,
+                });
+            }
+
+            // Add the hole
+            segments.push(ShapedSegment::Hole(hole.clone()));
+
+            last_end_cluster = hole.char_range.end;
+            last_end_text = hole.text_range.end;
+        }
+
+        // Add trailing shaped segment (if any)
+        if last_end_cluster < clusters.len() {
+            segments.push(ShapedSegment::Shaped {
+                cluster_range: last_end_cluster..clusters.len(),
+                text_range: last_end_text..text_len,
+            });
+        }
+
+        ShapedRunAnalysis {
+            segments,
+            has_holes: true,
+        }
+    }
+
+    /// Push a segment from a ProcessedRun to the layout.
+    /// The segment_cluster_range is the range of clusters within the ProcessedRun to push.
+    /// text_range is the absolute text range for this segment.
+    pub(crate) fn push_processed_segment(
+        &mut self,
+        run: &ProcessedRun,
+        segment_cluster_range: Range<usize>,
+        text_range: Range<usize>,
+    ) {
+        if segment_cluster_range.is_empty() {
+            return;
+        }
+
+        let coords_start = self.coords.len();
+        self.coords.extend(run.coords.iter().copied());
+        let coords_end = self.coords.len();
+
+        let cluster_range_start = self.clusters.len();
+        let glyph_start = self.glyphs.len();
+
+        // Copy the relevant clusters and glyphs
+        let segment_clusters = &run.clusters[segment_cluster_range.clone()];
+
+        // Calculate glyph range from cluster data
+        let mut segment_advance = 0.0f32;
+        let mut min_glyph_offset = usize::MAX;
+        let mut max_glyph_end = 0usize;
+
+        for cluster in segment_clusters {
+            segment_advance += cluster.advance;
+            if cluster.glyph_len != 0xFF && cluster.glyph_len > 0 {
+                let start = cluster.glyph_offset as usize;
+                let end = start + cluster.glyph_len as usize;
+                min_glyph_offset = min_glyph_offset.min(start);
+                max_glyph_end = max_glyph_end.max(end);
+            }
+        }
+
+        // Copy glyphs and adjust cluster glyph offsets
+        let glyph_base_offset = if min_glyph_offset < usize::MAX {
+            // Copy the relevant glyphs
+            self.glyphs
+                .extend_from_slice(&run.glyphs[min_glyph_offset..max_glyph_end]);
+            min_glyph_offset
+        } else {
+            0
+        };
+
+        // Calculate text offset adjustment (first cluster's text_offset is the base)
+        let text_base_offset = segment_clusters
+            .first()
+            .map(|c| c.text_offset as usize)
+            .unwrap_or(0);
+
+        // Copy clusters with adjusted offsets
+        for cluster in segment_clusters {
+            let mut new_cluster = *cluster;
+
+            // Adjust glyph offset if not inlined
+            if new_cluster.glyph_len != 0xFF && new_cluster.glyph_len > 0 {
+                new_cluster.glyph_offset =
+                    (new_cluster.glyph_offset as usize - glyph_base_offset) as u32;
+            }
+
+            // Adjust text offset relative to segment start
+            new_cluster.text_offset = (new_cluster.text_offset as usize - text_base_offset) as u16;
+
+            self.clusters.push(new_cluster);
+        }
+
+        let run_data = RunData {
+            font_index: run.font_index,
+            font_size: run.font_size,
+            synthesis: run.synthesis.clone(),
+            coords_range: coords_start..coords_end,
+            text_range,
+            bidi_level: run.bidi_level,
+            cluster_range: cluster_range_start..self.clusters.len(),
+            glyph_start,
+            metrics: run.metrics.clone(),
+            word_spacing: run.word_spacing,
+            letter_spacing: run.letter_spacing,
+            advance: segment_advance,
+        };
+
+        self.runs.push(run_data);
+        self.items.push(LayoutItem {
+            kind: LayoutItemKind::TextRun,
+            index: self.runs.len() - 1,
+            bidi_level: run.bidi_level,
+        });
+    }
+
+    /// Push an entire ProcessedRun to the layout (no splitting).
+    pub(crate) fn push_processed_run(&mut self, run: &ProcessedRun) {
+        self.push_processed_segment(run, 0..run.clusters.len(), run.text_range.clone());
     }
 
     pub(crate) fn finish(&mut self) {
@@ -599,6 +1013,128 @@ impl<B: Brush> LayoutData<B> {
     }
 }
 
+/// Detects holes (clusters with glyph_id == 0) in the processed clusters.
+/// This is called after clusters are in logical order, so it works correctly for both LTR and RTL.
+///
+/// Returns a list of holes, where each hole is a contiguous range of clusters that have
+/// glyph_id == 0 (meaning the font couldn't render those characters).
+///
+/// **Important**: Combining marks are always included with their preceding base character's hole,
+/// even if the font claims to support the mark in isolation. This ensures proper rendering
+/// of composed characters like Arabic letters with diacritics.
+///
+/// Note: `glyphs` should be the slice of glyphs for this run only (not the entire layout).
+fn detect_holes(clusters: &[ClusterData], glyphs: &[Glyph]) -> Vec<Hole> {
+    let mut holes = Vec::new();
+    let mut hole_start: Option<usize> = None; // char index where hole starts
+    let mut hole_text_start: Option<usize> = None; // text offset where hole starts
+
+    // First pass: determine which clusters are holes, handling ligature components.
+    // A ligature component (glyph_len=0) is a hole if its "owner" cluster is a hole.
+    let mut is_hole_vec: Vec<bool> = Vec::with_capacity(clusters.len());
+
+    for cluster in clusters.iter() {
+        is_hole_vec.push(cluster_is_hole(cluster, glyphs));
+    }
+
+    // Handle ligature components: if cluster[i] has glyph_len=0, it's part of a ligature/combining sequence.
+    // The "owner" cluster (the one with the actual glyphs) could be before OR after this cluster:
+    // - LTR ligatures (e.g., "fi"): owner ('f') comes BEFORE component ('i')
+    // - Arabic combining marks: owner (fatha) might come AFTER base (alef)
+    // We look in both directions to find the nearest owner.
+    for i in 0..clusters.len() {
+        if clusters[i].glyph_len == 0 {
+            // Look backward first (for LTR ligatures)
+            let mut found = false;
+            if i > 0 {
+                for j in (0..i).rev() {
+                    if clusters[j].glyph_len != 0 {
+                        is_hole_vec[i] = is_hole_vec[j];
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            // TODO: This isn't required
+            // If not found backward, look forward (for combining marks)
+            if !found {
+                for j in (i + 1)..clusters.len() {
+                    if clusters[j].glyph_len != 0 {
+                        is_hole_vec[i] = is_hole_vec[j];
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    for (i, cluster) in clusters.iter().enumerate() {
+        let is_hole = is_hole_vec[i];
+        let is_combining = cluster.advance == 0.0;
+
+        // A cluster is considered part of a hole if:
+        // 1. It has glyph_id == 0 (font can't render it), OR
+        // 2. It's a combining mark and the previous cluster was a hole
+        //    (combining marks should stay with their base character)
+        let should_be_in_hole = is_hole || (is_combining && hole_start.is_some());
+
+        if should_be_in_hole {
+            // Start or continue a hole
+            if hole_start.is_none() {
+                hole_start = Some(i);
+                hole_text_start = Some(cluster.text_offset as usize);
+            }
+        } else if let Some(start_idx) = hole_start.take() {
+            // End the current hole
+            let text_start = hole_text_start.take().unwrap();
+            let text_end = cluster.text_offset as usize;
+            holes.push(Hole {
+                char_range: start_idx..i,
+                text_range: text_start..text_end,
+            });
+        }
+    }
+
+    // Handle hole at the end
+    if let Some(start_idx) = hole_start {
+        let text_start = hole_text_start.unwrap();
+        // For the last hole, compute end from the last cluster
+        if let Some(last_cluster) = clusters.last() {
+            let text_end = last_cluster.text_offset as usize + last_cluster.text_len as usize;
+            holes.push(Hole {
+                char_range: start_idx..clusters.len(),
+                text_range: text_start..text_end,
+            });
+        }
+    }
+
+    holes
+}
+
+/// Check if a cluster is a "hole" (font couldn't render it, glyph_id == 0).
+/// Note: `glyphs` should be the slice of glyphs for this run (already offset by glyph_base).
+fn cluster_is_hole(cluster: &ClusterData, glyphs: &[Glyph]) -> bool {
+    let is_hole = if cluster.glyph_len == 0xFF {
+        // Single glyph inlined - glyph_offset IS the glyph ID
+        cluster.glyph_offset == 0
+    } else if cluster.glyph_len == 0 {
+        // No glyphs (ligature component) - not a hole by itself
+        false
+    } else {
+        // Multiple glyphs - check if ALL are .notdef (id == 0)
+        // glyph_offset is already relative to the run's glyph_start
+        let start = cluster.glyph_offset as usize;
+        let end = start + cluster.glyph_len as usize;
+        if end <= glyphs.len() {
+            glyphs[start..end].iter().all(|g| g.id == 0)
+        } else {
+            false
+        }
+    };
+
+    is_hole
+}
+
 /// Processes shaped glyphs from `HarfRust` and converts them into `ClusterData` and `Glyph`.
 ///
 /// # Parameters
@@ -616,6 +1152,9 @@ impl<B: Brush> LayoutData<B> {
 /// * `char_infos` - Character information from text analysis, indexed by cluster ID.
 /// * `char_indices_iter` - Iterator over (`byte_offset`, `char`) pairs from the source text.
 ///   Should be in logical order (forward for LTR, reverse for RTL).
+///
+/// # Returns
+/// * `f32` - Total advance of the run.
 fn process_clusters<I: Iterator<Item = (usize, char)>>(
     direction: Direction,
     clusters: &mut Vec<ClusterData>,
@@ -738,6 +1277,9 @@ fn process_clusters<I: Iterator<Item = (usize, char)>>(
                     );
                 }
             }
+            // Hole tracking is currently disabled.
+            // TODO: Re-enable once RTL handling is properly implemented.
+
             cluster_start_char = char_indices_iter.next().unwrap();
 
             cluster_advance = 0.0;

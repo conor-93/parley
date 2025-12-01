@@ -4,16 +4,14 @@
 //! Text shaping implementation using `harfrust`for shaping
 //! and `icu` for text analysis.
 
-use core::mem;
 use core::ops::RangeInclusive;
 
-use alloc::string::String;
 use alloc::vec::Vec;
 
 use super::layout::Layout;
 use super::resolve::{RangedStyle, ResolveContext, Resolved};
 use super::style::{Brush, FontFeature, FontVariation};
-use crate::analysis::cluster::{Char, CharCluster, Status};
+use crate::analysis::cluster::{Char, CharCluster};
 use crate::analysis::{AnalysisDataSources, CharInfo};
 use crate::icu_convert::script_to_harfrust;
 use crate::inline_box::InlineBox;
@@ -33,7 +31,6 @@ pub(crate) struct ShapeContext {
     shape_plan_cache: LruCache<cache::ShapePlanId, harfrust::ShapePlan>,
     unicode_buffer: Option<harfrust::UnicodeBuffer>,
     features: Vec<harfrust::Feature>,
-    scratch_string: String,
     char_cluster: CharCluster,
 }
 
@@ -46,7 +43,6 @@ impl Default for ShapeContext {
             shape_plan_cache: LruCache::new(MAX_ENTRIES),
             unicode_buffer: Some(harfrust::UnicodeBuffer::new()),
             features: Vec::new(),
-            scratch_string: String::new(),
             char_cluster: CharCluster::default(),
         }
     }
@@ -277,7 +273,7 @@ fn shape_item<'a, B: Brush>(
     analysis_data_sources: &AnalysisDataSources,
 ) {
     let item_text = &text[text_range.clone()];
-    let item_infos = &infos[char_range.start..char_range.end]; // Only process current item
+    let item_infos = &infos[char_range.start..char_range.end];
     let first_style_index = item_infos[0].1;
     let fb_script = icu_convert::script_to_fontique(item.script, analysis_data_sources);
     let mut font_selector = FontSelector::new(
@@ -294,7 +290,6 @@ fn shape_item<'a, B: Brush>(
         .segment_str(item_text);
     let mut item_infos_iter = item_infos.iter();
     let mut code_unit_offset_in_string = text_range.start;
-    let char_cluster = &mut scx.char_cluster;
 
     // Build an iterator of boundaries and consume the first segment to seed the loop
     let mut boundaries_iter = grapheme_cluster_boundaries.skip(1);
@@ -307,16 +302,15 @@ fn shape_item<'a, B: Brush>(
         &item_text[last_boundary..current_boundary],
         &mut item_infos_iter,
         &mut code_unit_offset_in_string,
-        char_cluster,
+        &mut scx.char_cluster,
     );
 
-    let mut current_font =
-        font_selector.select_font(char_cluster, analysis_data_sources, &mut scx.scratch_string);
+    let mut current_font = font_selector.select_font(&mut scx.char_cluster);
 
-    // Main segmentation loop (based on swash shape_clusters) - only within current item
+    // Main segmentation loop - segment by font changes
     while let Some(font) = current_font.take() {
         // Collect all clusters for this font segment
-        let cluster_range = char_cluster.range();
+        let cluster_range = scx.char_cluster.range();
         let segment_start_offset = cluster_range.start as usize - text_range.start;
         let mut segment_end_offset = cluster_range.end as usize - text_range.start;
 
@@ -328,20 +322,16 @@ fn shape_item<'a, B: Brush>(
                 &item_text[last_boundary..current_boundary],
                 &mut item_infos_iter,
                 &mut code_unit_offset_in_string,
-                char_cluster,
+                &mut scx.char_cluster,
             );
 
-            if let Some(next_font) = font_selector.select_font(
-                char_cluster,
-                analysis_data_sources,
-                &mut scx.scratch_string,
-            ) {
+            if let Some(next_font) = font_selector.select_font(&mut scx.char_cluster) {
                 if next_font != font {
                     current_font = Some(next_font);
                     break;
                 } else {
                     // Same font - add to current segment
-                    segment_end_offset = char_cluster.range().end as usize - text_range.start;
+                    segment_end_offset = scx.char_cluster.range().end as usize - text_range.start;
                 }
             } else {
                 // No font determined, continue to next cluster
@@ -349,133 +339,478 @@ fn shape_item<'a, B: Brush>(
             }
         }
 
-        // Shape this font segment with harfrust
+        // Shape this font segment
         let segment_text = &item_text[segment_start_offset..segment_end_offset];
-        // Shape the entire segment text including newlines
-        // The line breaking algorithm will handle newlines automatically
-
-        // TODO: How do we want to handle errors like this?
-        let font_ref =
-            harfrust::FontRef::from_index(font.font.blob.as_ref(), font.font.index).unwrap();
-
-        // Create harfrust shaper
-        let shaper_data = scx.shape_data_cache.entry(
-            cache::ShapeDataKey::new(font.font.blob.id(), font.font.index),
-            || harfrust::ShaperData::new(&font_ref),
-        );
-        let instance = scx.shape_instance_cache.entry(
-            cache::ShapeInstanceKey::new(
-                font.font.blob.id(),
-                font.font.index,
-                &font.font.synthesis,
-                rcx.variations(item.variations),
-            ),
-            || {
-                harfrust::ShaperInstance::from_variations(
-                    &font_ref,
-                    variations_iter(&font.font.synthesis, rcx.variations(item.variations)),
-                )
-            },
-        );
-
-        let direction = if item.level & 1 != 0 {
-            harfrust::Direction::RightToLeft
-        } else {
-            harfrust::Direction::LeftToRight
-        };
-        let hb_script = script_to_harfrust(fb_script);
-        let language = item
-            .locale
-            .as_ref()
-            .and_then(|lang| lang.language.as_str().parse::<harfrust::Language>().ok());
-        scx.features.clear();
-        for feature in rcx.features(item.features).unwrap_or(&[]) {
-            scx.features.push(harfrust::Feature::new(
-                harfrust::Tag::from_u32(feature.tag),
-                feature.value as u32,
-                ..,
-            ));
-        }
-        let harf_shaper = shaper_data
-            .shaper(&font_ref)
-            .instance(Some(instance))
-            .point_size(Some(item.size))
-            .build();
-        let shaper_plan = scx.shape_plan_cache.entry(
-            cache::ShapePlanKey::new(
-                font.font.blob.id(),
-                font.font.index,
-                &font.font.synthesis,
-                direction,
-                hb_script,
-                language.clone(),
-                &scx.features,
-                rcx.variations(item.variations),
-            ),
-            || {
-                harfrust::ShapePlan::new(
-                    &harf_shaper,
-                    direction,
-                    Some(hb_script),
-                    language.as_ref(),
-                    &scx.features,
-                )
-            },
-        );
-
-        // Prepare harfrust buffer
-        let mut buffer = mem::take(&mut scx.unicode_buffer).unwrap();
-        buffer.clear();
-
-        // Use the entire segment text including newlines
-        buffer.reserve(segment_text.len());
-        for (i, ch) in segment_text.chars().enumerate() {
-            // Ensure that each cluster's index matches the index into `infos`. This is required
-            // for efficient cluster lookup within `data.rs`.
-            //
-            // In other words, instead of using `buffer.push_str`, which iterates `segment_text`
-            // with `char_indices`, push each char individually via `.chars` with a cluster index
-            // that matches its `infos` counterpart. This allows us to lookup `infos` via cluster
-            // index in `data.rs`.
-            buffer.add(ch, i as u32);
-        }
-
-        buffer.set_direction(direction);
-
-        buffer.set_script(hb_script);
-
-        if let Some(lang) = language {
-            buffer.set_language(lang);
-        }
-
-        let glyph_buffer = harf_shaper.shape_with_plan(shaper_plan, buffer, &scx.features);
-
-        // Extract relevant CharInfo slice for this segment
         let char_start = char_range.start + item_text[..segment_start_offset].chars().count();
         let segment_char_start = char_start - char_range.start;
         let segment_char_count = segment_text.chars().count();
         let segment_infos =
             &item_infos[segment_char_start..(segment_char_start + segment_char_count)];
 
-        // Push harfrust-shaped run for the entire segment
-        layout.data.push_run(
-            FontData::new(font.font.blob.clone(), font.font.index),
-            item.size,
-            font.font.synthesis,
-            &glyph_buffer,
-            item.level,
-            item.style_index,
-            item.word_spacing,
-            item.letter_spacing,
+        // Shape with the selected font
+        // Shape into ProcessedRun (without pushing to layout yet)
+        let segment_abs_text_range =
+            (text_range.start + segment_start_offset)..(text_range.start + segment_end_offset);
+        let processed_run = shape_to_processed_run(
+            rcx,
+            item,
+            scx,
+            layout,
+            &font,
+            fb_script,
             segment_text,
             segment_infos,
-            (text_range.start + segment_start_offset)..(text_range.start + segment_end_offset),
-            harf_shaper.coords(),
+            segment_abs_text_range.clone(),
         );
 
-        // Replace buffer to reuse allocation in next iteration.
-        scx.unicode_buffer = Some(glyph_buffer.clear());
+        // Analyze for holes
+        let analysis = crate::layout::data::LayoutData::<B>::analyze_processed_run(
+            &processed_run,
+            segment_text.len(),
+        );
+
+        if !analysis.has_holes {
+            // No holes - push the entire run directly (preserves shaped data)
+            layout.data.push_processed_run(&processed_run);
+        } else {
+            // Has holes - process each segment
+            use crate::layout::data::ShapedSegment;
+
+            for segment in analysis.segments {
+                match segment {
+                    ShapedSegment::Shaped {
+                        cluster_range,
+                        text_range: seg_text_range,
+                    } => {
+                        // Push the shaped portion directly from ProcessedRun (no reshaping!)
+                        let abs_text_range = (segment_abs_text_range.start + seg_text_range.start)
+                            ..(segment_abs_text_range.start + seg_text_range.end);
+                        layout.data.push_processed_segment(
+                            &processed_run,
+                            cluster_range,
+                            abs_text_range,
+                        );
+                    }
+                    ShapedSegment::Hole(hole) => {
+                        // Reshape this hole with fallback fonts
+                        let hole_text = &segment_text[hole.text_range.clone()];
+                        let hole_char_start = segment_char_start + hole.char_range.start;
+                        let hole_char_end = segment_char_start + hole.char_range.end;
+                        let hole_infos = &item_infos[hole_char_start..hole_char_end];
+
+                        if !hole_text.is_empty() && !hole_infos.is_empty() {
+                            let abs_hole_range = (segment_abs_text_range.start
+                                + hole.text_range.start)
+                                ..(segment_abs_text_range.start + hole.text_range.end);
+                            shape_hole_with_fallback(
+                                rcx,
+                                item,
+                                scx,
+                                layout,
+                                &font,
+                                fb_script,
+                                hole_text,
+                                hole_infos,
+                                abs_hole_range,
+                                analysis_data_sources,
+                                &mut font_selector,
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
+}
+
+/// Shape a hole with fallback fonts. If a fallback font also has holes,
+/// recursively process those sub-holes.
+#[allow(clippy::too_many_arguments)]
+fn shape_hole_with_fallback<'a, B: Brush>(
+    rcx: &'a ResolveContext,
+    item: &Item,
+    scx: &mut ShapeContext,
+    layout: &mut Layout<B>,
+    primary_font: &SelectedFont,
+    fb_script: fontique::Script,
+    hole_text: &str,
+    hole_infos: &[(CharInfo, u16)],
+    text_range: core::ops::Range<usize>,
+    analysis_data_sources: &AnalysisDataSources,
+    font_selector: &mut FontSelector<'a, '_, B>,
+) {
+    // Set up the cluster with the hole's text so the font selector can
+    // configure the query for the correct style
+    // TODO: Don't repeat this work
+    let seg_boundaries = analysis_data_sources
+        .grapheme_segmenter()
+        .segment_str(hole_text);
+    let mut seg_iter = seg_boundaries.skip(1);
+    let first_seg_boundary = seg_iter.next().unwrap_or(hole_text.len());
+
+    {
+        let mut temp_infos_iter = hole_infos.iter();
+        let mut temp_offset = text_range.start;
+        fill_cluster_in_place(
+            &hole_text[0..first_seg_boundary],
+            &mut temp_infos_iter,
+            &mut temp_offset,
+            &mut scx.char_cluster,
+        );
+    }
+
+    // First call select_font to configure the query for this style
+    let _ = font_selector.select_font(&mut scx.char_cluster);
+
+    // Now find a fallback font (skip the primary font we already tried)
+    let tried_fonts = vec![primary_font.clone()];
+    let fallback = font_selector.select_next_font(&tried_fonts);
+
+    match fallback {
+        Some(fallback_font) => {
+            // Shape with fallback font into ProcessedRun (preserves shaped data)
+            let processed = shape_to_processed_run(
+                rcx,
+                item,
+                scx,
+                layout,
+                &fallback_font,
+                fb_script,
+                hole_text,
+                hole_infos,
+                text_range.clone(),
+            );
+
+            let analysis = crate::layout::data::LayoutData::<B>::analyze_processed_run(
+                &processed,
+                hole_text.len(),
+            );
+
+            if !analysis.has_holes {
+                // Fallback worked! Push the entire run
+                layout.data.push_processed_run(&processed);
+            } else {
+                // Fallback also has holes - process segments
+                use crate::layout::data::ShapedSegment;
+
+                let mut tried_fonts = vec![primary_font.clone(), fallback_font.clone()];
+
+                for segment in analysis.segments {
+                    match segment {
+                        ShapedSegment::Shaped {
+                            cluster_range,
+                            text_range: seg_text_range,
+                        } => {
+                            // Push shaped portion directly (no reshaping!)
+                            let abs_range = (text_range.start + seg_text_range.start)
+                                ..(text_range.start + seg_text_range.end);
+
+                            layout.data.push_processed_segment(
+                                &processed,
+                                cluster_range,
+                                abs_range,
+                            );
+                        }
+                        ShapedSegment::Hole(hole) => {
+                            // Recursively process sub-hole
+                            let sub_hole_text = &hole_text[hole.text_range.clone()];
+                            let sub_hole_infos = &hole_infos[hole.char_range.clone()];
+
+                            if !sub_hole_text.is_empty() && !sub_hole_infos.is_empty() {
+                                let abs_range = (text_range.start + hole.text_range.start)
+                                    ..(text_range.start + hole.text_range.end);
+                                shape_hole_with_fallback_tried(
+                                    rcx,
+                                    item,
+                                    scx,
+                                    layout,
+                                    primary_font,
+                                    fb_script,
+                                    sub_hole_text,
+                                    sub_hole_infos,
+                                    abs_range,
+                                    analysis_data_sources,
+                                    font_selector,
+                                    &mut tried_fonts,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None => {
+            // No fallback - shape with primary font for .notdef glyphs
+            let processed = shape_to_processed_run(
+                rcx,
+                item,
+                scx,
+                layout,
+                primary_font,
+                fb_script,
+                hole_text,
+                hole_infos,
+                text_range,
+            );
+            layout.data.push_processed_run(&processed);
+        }
+    }
+}
+
+/// Shape a hole with fallback fonts, given a list of already-tried fonts.
+#[allow(clippy::too_many_arguments)]
+fn shape_hole_with_fallback_tried<'a, B: Brush>(
+    rcx: &'a ResolveContext,
+    item: &Item,
+    scx: &mut ShapeContext,
+    layout: &mut Layout<B>,
+    primary_font: &SelectedFont,
+    fb_script: fontique::Script,
+    hole_text: &str,
+    hole_infos: &[(CharInfo, u16)],
+    text_range: core::ops::Range<usize>,
+    analysis_data_sources: &AnalysisDataSources,
+    font_selector: &mut FontSelector<'a, '_, B>,
+    tried_fonts: &mut Vec<SelectedFont>,
+) {
+    // Set up the cluster with the hole's text so the font selector can
+    // configure the query for the correct style
+    let seg_boundaries = analysis_data_sources
+        .grapheme_segmenter()
+        .segment_str(hole_text);
+    let mut seg_iter = seg_boundaries.skip(1);
+    let first_seg_boundary = seg_iter.next().unwrap_or(hole_text.len());
+
+    {
+        let mut temp_infos_iter = hole_infos.iter();
+        let mut temp_offset = text_range.start;
+        fill_cluster_in_place(
+            &hole_text[0..first_seg_boundary],
+            &mut temp_infos_iter,
+            &mut temp_offset,
+            &mut scx.char_cluster,
+        );
+    }
+
+    // First call select_font to configure the query for this style
+    let _ = font_selector.select_font(&mut scx.char_cluster);
+
+    // Now select next fallback font (skip fonts we've already tried)
+    let fallback = font_selector.select_next_font(tried_fonts);
+
+    match fallback {
+        Some(fallback_font) => {
+            // Shape with fallback font into ProcessedRun (preserves shaped data)
+            let processed = shape_to_processed_run(
+                rcx,
+                item,
+                scx,
+                layout,
+                &fallback_font,
+                fb_script,
+                hole_text,
+                hole_infos,
+                text_range.clone(),
+            );
+
+            let analysis = crate::layout::data::LayoutData::<B>::analyze_processed_run(
+                &processed,
+                hole_text.len(),
+            );
+
+            if !analysis.has_holes {
+                // Fallback worked! Push the entire run
+                layout.data.push_processed_run(&processed);
+            } else {
+                // Still has holes - process segments
+                use crate::layout::data::ShapedSegment;
+
+                tried_fonts.push(fallback_font.clone());
+
+                for segment in analysis.segments {
+                    match segment {
+                        ShapedSegment::Shaped {
+                            cluster_range,
+                            text_range: seg_text_range,
+                        } => {
+                            // Push shaped portion directly (no reshaping!)
+                            let abs_range = (text_range.start + seg_text_range.start)
+                                ..(text_range.start + seg_text_range.end);
+                            layout.data.push_processed_segment(
+                                &processed,
+                                cluster_range,
+                                abs_range,
+                            );
+                        }
+                        ShapedSegment::Hole(hole) => {
+                            // Recursively process sub-hole
+                            let sub_hole_text = &hole_text[hole.text_range.clone()];
+                            let sub_hole_infos = &hole_infos[hole.char_range.clone()];
+
+                            if !sub_hole_text.is_empty() && !sub_hole_infos.is_empty() {
+                                let abs_range = (text_range.start + hole.text_range.start)
+                                    ..(text_range.start + hole.text_range.end);
+                                shape_hole_with_fallback_tried(
+                                    rcx,
+                                    item,
+                                    scx,
+                                    layout,
+                                    primary_font,
+                                    fb_script,
+                                    sub_hole_text,
+                                    sub_hole_infos,
+                                    abs_range,
+                                    analysis_data_sources,
+                                    font_selector,
+                                    tried_fonts,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None => {
+            // No more fallbacks - shape with primary font for .notdef glyphs
+            let processed = shape_to_processed_run(
+                rcx,
+                item,
+                scx,
+                layout,
+                primary_font,
+                fb_script,
+                hole_text,
+                hole_infos,
+                text_range,
+            );
+            layout.data.push_processed_run(&processed);
+        }
+    }
+}
+
+/// Shape a text segment with a specific font into a ProcessedRun (without pushing to layout).
+/// This allows analyzing for holes before deciding how to push.
+#[allow(clippy::too_many_arguments)]
+fn shape_to_processed_run<B: Brush>(
+    rcx: &ResolveContext,
+    item: &Item,
+    scx: &mut ShapeContext,
+    layout: &mut Layout<B>,
+    font: &SelectedFont,
+    fb_script: fontique::Script,
+    segment_text: &str,
+    segment_infos: &[(CharInfo, u16)],
+    text_range: core::ops::Range<usize>,
+) -> crate::layout::data::ProcessedRun {
+    let font_ref = harfrust::FontRef::from_index(font.font.blob.as_ref(), font.font.index).unwrap();
+
+    let direction = if item.level & 1 != 0 {
+        harfrust::Direction::RightToLeft
+    } else {
+        harfrust::Direction::LeftToRight
+    };
+    let hb_script = script_to_harfrust(fb_script);
+    let language = item
+        .locale
+        .as_ref()
+        .and_then(|lang| lang.language.as_str().parse::<harfrust::Language>().ok());
+
+    // Acquire buffer from pool first (before cache borrows)
+    let mut buffer = std::mem::take(&mut scx.unicode_buffer).unwrap();
+    buffer.clear();
+    buffer.reserve(segment_text.len());
+
+    for (i, ch) in segment_text.chars().enumerate() {
+        buffer.add(ch, i as u32);
+    }
+    buffer.set_direction(direction);
+    buffer.set_script(hb_script);
+    if let Some(ref lang) = language {
+        buffer.set_language(lang.clone());
+    }
+
+    // Build features list
+    scx.features.clear();
+    for feature in rcx.features(item.features).unwrap_or(&[]) {
+        scx.features.push(harfrust::Feature::new(
+            harfrust::Tag::from_u32(feature.tag),
+            feature.value as u32,
+            ..,
+        ));
+    }
+
+    // Build cache keys before borrowing caches
+    let data_key = cache::ShapeDataKey::new(font.font.blob.id(), font.font.index);
+    let instance_key = cache::ShapeInstanceKey::new(
+        font.font.blob.id(),
+        font.font.index,
+        &font.font.synthesis,
+        rcx.variations(item.variations),
+    );
+    let plan_key = cache::ShapePlanKey::new(
+        font.font.blob.id(),
+        font.font.index,
+        &font.font.synthesis,
+        direction,
+        hb_script,
+        language.clone(),
+        &scx.features,
+        rcx.variations(item.variations),
+    );
+
+    // Access caches and shape
+    let (glyph_buffer, coords) = {
+        let shaper_data = scx
+            .shape_data_cache
+            .entry(data_key, || harfrust::ShaperData::new(&font_ref));
+        let instance = scx.shape_instance_cache.entry(instance_key, || {
+            harfrust::ShaperInstance::from_variations(
+                &font_ref,
+                variations_iter(&font.font.synthesis, rcx.variations(item.variations)),
+            )
+        });
+
+        let harf_shaper = shaper_data
+            .shaper(&font_ref)
+            .instance(Some(instance))
+            .point_size(Some(item.size))
+            .build();
+
+        let shaper_plan = scx.shape_plan_cache.entry(plan_key, || {
+            harfrust::ShapePlan::new(
+                &harf_shaper,
+                direction,
+                Some(hb_script),
+                language.as_ref(),
+                &scx.features,
+            )
+        });
+
+        let glyph_buffer = harf_shaper.shape_with_plan(shaper_plan, buffer, &scx.features);
+        let coords: Vec<_> = harf_shaper.coords().to_vec();
+        (glyph_buffer, coords)
+    };
+
+    // Process to temp storage (don't push yet)
+    let processed = layout.data.process_run_to_temp(
+        FontData::new(font.font.blob.clone(), font.font.index),
+        item.size,
+        font.font.synthesis.clone(),
+        &glyph_buffer,
+        item.level,
+        item.style_index,
+        item.word_spacing,
+        item.letter_spacing,
+        segment_text,
+        segment_infos,
+        text_range,
+        &coords,
+    );
+
+    // Return buffer to context
+    scx.unicode_buffer = Some(glyph_buffer.clear());
+
+    processed
 }
 
 fn real_script(script: Script) -> bool {
@@ -551,12 +886,13 @@ impl<'a, 'b, B: Brush> FontSelector<'a, 'b, B> {
         }
     }
 
-    fn select_font(
-        &mut self,
-        cluster: &mut CharCluster,
-        analysis_data_sources: &AnalysisDataSources,
-        scratch_string: &mut String,
-    ) -> Option<SelectedFont> {
+    /// Select a font for the given cluster, checking character coverage.
+    /// Used for initial font selection where we want to pick a font that can render the text.
+    /// Select a font based on style attributes and character coverage.
+    /// Select a font based on style attributes.
+    /// Does NOT check character coverage - the shaper will tell us which characters
+    /// couldn't be rendered (glyph_id == 0), and we handle those as holes.
+    fn select_font(&mut self, cluster: &mut CharCluster) -> Option<SelectedFont> {
         let style_index = cluster.style_index();
         let is_emoji = cluster.is_emoji;
         if style_index != self.style_index || is_emoji || self.fonts_id.is_none() {
@@ -588,51 +924,36 @@ impl<'a, 'b, B: Brush> FontSelector<'a, 'b, B> {
             self.variations = self.rcx.variations(style.font_variations).unwrap_or(&[]);
             self.features = self.rcx.features(style.font_features).unwrap_or(&[]);
         }
+
+        // Just return the first matching font - no coverage checking.
+        // The shaper will tell us which characters couldn't be rendered.
         let mut selected_font = None;
         self.query.matches_with(|font| {
-            let Some(charmap) = font.charmap() else {
+            selected_font = Some(font.into());
+            fontique::QueryStatus::Stop
+        });
+        selected_font
+    }
+
+    /// Select the next font in the fallback chain, skipping any fonts we've already tried.
+    /// Unlike `select_font`, this doesn't check character coverage - the shaper already
+    /// told us which characters couldn't be rendered (glyph_id == 0).
+    fn select_next_font(&mut self, skip_fonts: &[SelectedFont]) -> Option<SelectedFont> {
+        let mut selected_font = None;
+        self.query.matches_with(|font| {
+            let candidate: SelectedFont = font.into();
+            if skip_fonts.iter().any(|skip| *skip == candidate) {
                 return fontique::QueryStatus::Continue;
-            };
-
-            let map_status = cluster.map(
-                |ch| {
-                    charmap
-                        .map(ch)
-                        .map(|g| {
-                            // HACK: in reality, we're only computing coverage, so
-                            // we only care about whether the font  has a mapping
-                            // for a particular glyph. Any non-zero value indicates
-                            // the existence of a glyph so we can simplify this
-                            // without a fallible conversion from u32 to u16.
-                            (g != 0) as u16
-                        })
-                        .unwrap_or_default()
-                },
-                analysis_data_sources,
-                scratch_string,
-            );
-
-            match map_status {
-                Status::Complete => {
-                    selected_font = Some(font.into());
-                    fontique::QueryStatus::Stop
-                }
-                Status::Keep => {
-                    selected_font = Some(font.into());
-                    fontique::QueryStatus::Continue
-                }
-                Status::Discard => {
-                    if selected_font.is_none() {
-                        selected_font = Some(font.into());
-                    }
-                    fontique::QueryStatus::Continue
-                }
             }
+            // Return the first font we haven't tried yet
+            selected_font = Some(candidate);
+            fontique::QueryStatus::Stop
         });
         selected_font
     }
 }
 
+#[derive(Clone)]
 struct SelectedFont {
     font: QueryFont,
 }
