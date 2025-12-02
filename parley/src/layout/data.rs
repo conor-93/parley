@@ -426,210 +426,12 @@ impl<B: Brush> LayoutData<B> {
         });
     }
 
-    // So the plan is:
-    // 1. Shape the text without font selection
-    // 2. If in layout analysis, we find holes (as determined by 0 glyph IDs), we:
-    //      - If not empty, push the current state as a run
-    //      - If there's more to process, push the current iterative state to a stack
-    //          - Maybe just a reference to the original run + per-glyph-iterators
-    //  3. Repeat from 1 until stack is empty, but where non-first iterations:
-    //      - Keep track of total advance to push glyphs accordingly
-    //
-    //
-    // Questions:
-    // - How do we offset the glyphs that were positioned after some hole? Maybe it's as simple
-    // as tracking the total advance, which we already do. We could add it to the run.
-
-    // Invariants useful for shaper based itemisation:
-    // - char_infos len is the total width of the clusters
-
-    /// Push a shaped run to the layout.
-    ///
-    /// Returns a list of holes (ranges with glyph_id == 0) that need to be
-    /// reshaped with fallback fonts. If the list is empty, the entire run
-    /// was successfully shaped.
-    /// Push a run directly from a glyph buffer (legacy method, kept for reference).
-    #[allow(clippy::too_many_arguments)]
-    #[allow(dead_code)]
-    pub(crate) fn push_run(
-        &mut self,
-        font: FontData,
-        font_size: f32,
-        synthesis: fontique::Synthesis,
-        glyph_buffer: &harfrust::GlyphBuffer,
-        bidi_level: u8,
-        style_index: u16,
-        word_spacing: f32,
-        letter_spacing: f32,
-        source_text: &str,
-        char_infos: &[(CharInfo, u16)], // From text analysis
-        text_range: Range<usize>,       // The text range this run covers
-        coords: &[harfrust::NormalizedCoord],
-    ) -> Vec<Hole> {
-        let coords_start = self.coords.len();
-        self.coords.extend(coords.iter().map(|c| c.to_bits()));
-        let coords_end = self.coords.len();
-
-        let font_index = self
-            .fonts
-            .iter()
-            .position(|f| *f == font)
-            .unwrap_or_else(|| {
-                let index = self.fonts.len();
-                self.fonts.push(font);
-                index
-            });
-
-        let metrics = {
-            let font = &self.fonts[font_index];
-            let font_ref = skrifa::FontRef::from_index(font.data.as_ref(), font.index).unwrap();
-            skrifa::metrics::Metrics::new(&font_ref, skrifa::prelude::Size::new(font_size), coords)
-        };
-        let units_per_em = metrics.units_per_em as f32;
-
-        let metrics = {
-            let (underline_offset, underline_size) = if let Some(underline) = metrics.underline {
-                (underline.offset, underline.thickness)
-            } else {
-                // Default values from Harfbuzz: https://github.com/harfbuzz/harfbuzz/blob/00492ec7df0038f41f78d43d477c183e4e4c506e/src/hb-ot-metrics.cc#L334
-                let default = units_per_em / 18.0;
-                (default, default)
-            };
-            let (strikethrough_offset, strikethrough_size) =
-                if let Some(strikeout) = metrics.strikeout {
-                    (strikeout.offset, strikeout.thickness)
-                } else {
-                    // Default values from HarfBuzz: https://github.com/harfbuzz/harfbuzz/blob/00492ec7df0038f41f78d43d477c183e4e4c506e/src/hb-ot-metrics.cc#L334-L347
-                    (metrics.ascent / 2.0, units_per_em / 18.0)
-                };
-
-            // Compute line height
-            let style = &self.styles[style_index as usize];
-            let line_height = match style.line_height {
-                LineHeight::Absolute(value) => value,
-                LineHeight::FontSizeRelative(value) => value * font_size,
-                LineHeight::MetricsRelative(value) => {
-                    (metrics.ascent - metrics.descent + metrics.leading) * value
-                }
-            };
-
-            RunMetrics {
-                ascent: metrics.ascent,
-                descent: -metrics.descent,
-                leading: metrics.leading,
-                underline_offset,
-                underline_size,
-                strikethrough_offset,
-                strikethrough_size,
-                line_height,
-            }
-        };
-
-        let cluster_range = self.clusters.len()..self.clusters.len();
-
-        let mut run = RunData {
-            font_index,
-            font_size,
-            synthesis,
-            coords_range: coords_start..coords_end,
-            text_range,
-            bidi_level,
-            cluster_range,
-            glyph_start: self.glyphs.len(),
-            metrics,
-            word_spacing,
-            letter_spacing,
-            advance: 0.,
-        };
-
-        // `HarfRust` returns glyphs in visual order, so we need to process them as such while
-        // maintaining logical ordering of clusters.
-
-        let glyph_infos = glyph_buffer.glyph_infos();
-        if glyph_infos.is_empty() {
-            return Vec::new();
-        }
-        let glyph_positions = glyph_buffer.glyph_positions();
-        let scale_factor = font_size / units_per_em;
-        let cluster_range_start = self.clusters.len();
-        let is_rtl = bidi_level & 1 == 1;
-        let glyph_start = self.glyphs.len();
-        if !is_rtl {
-            let advance = process_clusters(
-                Direction::Ltr,
-                &mut self.clusters,
-                &mut self.glyphs,
-                scale_factor,
-                glyph_infos,
-                glyph_positions,
-                char_infos,
-                source_text.char_indices(),
-            );
-            run.advance = advance;
-        } else {
-            let advance = process_clusters(
-                Direction::Rtl,
-                &mut self.clusters,
-                &mut self.glyphs,
-                scale_factor,
-                glyph_infos,
-                glyph_positions,
-                char_infos,
-                source_text.char_indices().rev(),
-            );
-            run.advance = advance;
-            // Reverse clusters into logical order for RTL
-            let clusters_len = self.clusters.len();
-            self.clusters[cluster_range_start..clusters_len].reverse();
-        };
-
-        run.cluster_range = cluster_range_start..self.clusters.len();
-        assert_eq!(run.cluster_range.len(), char_infos.len());
-
-        // Detect holes (clusters with glyph_id == 0) now that clusters are in logical order.
-        // This works correctly for both LTR and RTL since clusters are already normalized.
-        let holes = detect_holes(
-            &self.clusters[run.cluster_range.clone()],
-            &self.glyphs[glyph_start..],
-        );
-
-        if !run.cluster_range.is_empty() {
-            self.runs.push(run);
-            self.items.push(LayoutItem {
-                kind: LayoutItemKind::TextRun,
-                index: self.runs.len() - 1,
-                bidi_level,
-            });
-        }
-
-        holes
-    }
-
-    /// Remove the last pushed run along with its clusters and glyphs.
-    /// Used when a run has holes and needs to be re-shaped with fallback fonts.
-    #[allow(dead_code)]
-    pub(crate) fn undo_last_run(&mut self) {
-        // Remove the last item (should be a TextRun)
-        if let Some(last_item) = self.items.pop() {
-            debug_assert_eq!(last_item.kind, LayoutItemKind::TextRun);
-        }
-
-        // Remove the last run and its associated data
-        if let Some(run) = self.runs.pop() {
-            // Remove clusters for this run
-            self.clusters.truncate(run.cluster_range.start);
-            // Remove glyphs for this run
-            self.glyphs.truncate(run.glyph_start);
-            // Remove coords for this run
-            self.coords.truncate(run.coords_range.start);
-        }
-    }
-
     /// Process a glyph buffer into a `ProcessedRun` WITHOUT pushing to layout.
     /// This allows analyzing for holes before deciding how to push.
     ///
     /// The `cached_metrics` are computed by the shaper with LRU caching.
     /// The `clusters` and `glyphs` vecs are provided from allocation pools.
+    /// The `coords` are passed by ownership to avoid cloning.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn process_run_to_temp(
         &mut self,
@@ -644,7 +446,7 @@ impl<B: Brush> LayoutData<B> {
         source_text: &str,
         char_infos: &[(CharInfo, u16)],
         text_range: Range<usize>,
-        coords: &[i16],
+        coords: Vec<i16>,
         cached_metrics: &crate::shape::cache::CachedMetrics,
         mut clusters: Vec<ClusterData>,
         mut glyphs: Vec<Glyph>,
@@ -680,7 +482,7 @@ impl<B: Brush> LayoutData<B> {
                 font_index,
                 font_size,
                 synthesis,
-                coords: coords.to_vec(),
+                coords,
                 bidi_level,
                 style_index,
                 word_spacing,
@@ -728,7 +530,7 @@ impl<B: Brush> LayoutData<B> {
             font_index,
             font_size,
             synthesis,
-            coords: coords.to_vec(),
+            coords,
             bidi_level,
             style_index,
             word_spacing,
@@ -739,18 +541,21 @@ impl<B: Brush> LayoutData<B> {
 
     /// Analyzes a glyph buffer and returns segments (shaped vs holes) in text order.
     /// This is used to split shaped data for hole-based font fallback.
-    pub(crate) fn analyze_processed_run(run: &ProcessedRun, text_len: usize) -> ShapedRunAnalysis {
+    ///
+    /// The `holes` vec is used as scratch space and will be cleared/reused.
+    pub(crate) fn analyze_processed_run(
+        run: &ProcessedRun,
+        text_len: usize,
+        holes: &mut Vec<Hole>,
+    ) -> ShapedRunAnalysis {
         let clusters = &run.clusters;
         let glyphs = &run.glyphs;
-        let holes = detect_holes(clusters, glyphs);
+        detect_holes(clusters, glyphs, holes);
 
         if holes.is_empty() {
-            // No holes - everything is shaped
+            // No holes - return empty segments (caller checks has_holes first)
             return ShapedRunAnalysis {
-                segments: vec![ShapedSegment::Shaped {
-                    cluster_range: 0..clusters.len(),
-                    text_range: 0..text_len,
-                }],
+                segments: Vec::new(),
                 has_holes: false,
             };
         }
@@ -760,7 +565,7 @@ impl<B: Brush> LayoutData<B> {
         let mut last_end_cluster = 0;
         let mut last_end_text = 0;
 
-        for hole in holes {
+        for hole in holes.iter() {
             // Add shaped segment before this hole (if any)
             if hole.char_range.start > last_end_cluster {
                 segments.push(ShapedSegment::Shaped {
@@ -1005,8 +810,10 @@ impl<B: Brush> LayoutData<B> {
 /// of composed characters like Arabic letters with diacritics.
 ///
 /// Note: `glyphs` should be the slice of glyphs for this run only (not the entire layout).
-fn detect_holes(clusters: &[ClusterData], glyphs: &[Glyph]) -> Vec<Hole> {
-    let mut holes = Vec::new();
+/// The `holes` vec is cleared at the start and filled with detected holes.
+fn detect_holes(clusters: &[ClusterData], glyphs: &[Glyph], holes: &mut Vec<Hole>) {
+    holes.clear();
+
     let mut hole_start: Option<usize> = None; // char index where hole starts
     let mut hole_text_start: Option<usize> = None; // text offset where hole starts
 
@@ -1088,8 +895,6 @@ fn detect_holes(clusters: &[ClusterData], glyphs: &[Glyph]) -> Vec<Hole> {
             });
         }
     }
-
-    holes
 }
 
 /// Check if a cluster is a "hole" (font couldn't render it, glyph_id == 0).

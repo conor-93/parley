@@ -37,6 +37,7 @@ pub(crate) struct ShapeContext {
     cluster_pool: cache::VecPool<crate::layout::data::ClusterData>,
     glyph_pool: cache::VecPool<crate::layout::Glyph>,
     tried_fonts_pool: cache::VecPool<SelectedFont>,
+    hole_pool: cache::VecPool<crate::layout::data::Hole>,
 }
 
 impl Default for ShapeContext {
@@ -54,6 +55,7 @@ impl Default for ShapeContext {
             cluster_pool: cache::VecPool::new(MAX_POOL_SIZE),
             glyph_pool: cache::VecPool::new(MAX_POOL_SIZE),
             tried_fonts_pool: cache::VecPool::new(MAX_POOL_SIZE),
+            hole_pool: cache::VecPool::new(MAX_POOL_SIZE),
         }
     }
 }
@@ -374,6 +376,7 @@ fn shape_item<'a, B: Brush>(
 
         // Analyze for holes and push, using fallback fonts for any holes
         let mut tried_fonts = scx.tried_fonts_pool.acquire();
+        let mut holes = scx.hole_pool.acquire();
         push_run_with_fallback(
             rcx,
             item,
@@ -389,8 +392,10 @@ fn shape_item<'a, B: Brush>(
             analysis_data_sources,
             &mut font_selector,
             &mut tried_fonts,
+            &mut holes,
             true, // Reset tried_fonts for each sibling hole
         );
+        scx.hole_pool.release(holes);
         scx.tried_fonts_pool.release(tried_fonts);
     }
 }
@@ -405,6 +410,7 @@ fn shape_item<'a, B: Brush>(
 /// - `primary_font`: The first font selected for this text (used for .notdef when no fallbacks work)
 /// - `current_font`: The font used for this particular ProcessedRun
 /// - `tried_fonts`: Tracks fonts we've already tried
+/// - `holes`: Scratch space for hole detection (pooled allocation)
 /// - `reset_per_hole`: If true, reset tried_fonts for each hole (for sibling holes at top level).
 ///                     If false, accumulate tried_fonts across sub-holes (for recursive calls).
 #[allow(clippy::too_many_arguments)]
@@ -423,12 +429,16 @@ fn push_run_with_fallback<'a, B: Brush>(
     analysis_data_sources: &AnalysisDataSources,
     font_selector: &mut FontSelector<'a, '_, B>,
     tried_fonts: &mut Vec<SelectedFont>,
+    holes: &mut Vec<crate::layout::data::Hole>,
     reset_per_hole: bool,
 ) {
     use crate::layout::data::ShapedSegment;
 
-    let analysis =
-        crate::layout::data::LayoutData::<B>::analyze_processed_run(processed, segment_text.len());
+    let analysis = crate::layout::data::LayoutData::<B>::analyze_processed_run(
+        processed,
+        segment_text.len(),
+        holes,
+    );
 
     if !analysis.has_holes {
         // No holes - push the entire run
@@ -522,6 +532,7 @@ fn push_run_with_fallback<'a, B: Brush>(
                                 analysis_data_sources,
                                 font_selector,
                                 tried_fonts,
+                                holes,
                                 false, // Don't reset for sub-holes
                             );
 
@@ -704,12 +715,15 @@ fn shape_to_processed_run<B: Brush>(
         }
     });
 
-    // Convert coords to i16 for storage (only allocate here, not for lookup)
+    // Convert coords to i16 for storage (owned, passed directly to avoid clone)
     let coords_i16: Vec<i16> = coords.iter().map(|c| c.to_bits()).collect();
 
-    // Acquire vectors from pools
-    let clusters = scx.cluster_pool.acquire();
-    let glyphs = scx.glyph_pool.acquire();
+    // Acquire vectors from pools and reserve capacity
+    let mut clusters = scx.cluster_pool.acquire();
+    clusters.reserve(segment_infos.len());
+    let mut glyphs = scx.glyph_pool.acquire();
+    // Estimate ~1.5 glyphs per character (handles ligatures, complex scripts)
+    glyphs.reserve(segment_infos.len() + segment_infos.len() / 2);
 
     // Process to temp storage (don't push yet)
     let processed = layout.data.process_run_to_temp(
@@ -724,7 +738,7 @@ fn shape_to_processed_run<B: Brush>(
         segment_text,
         segment_infos,
         text_range,
-        &coords_i16,
+        coords_i16, // Pass by ownership
         cached_metrics,
         clusters,
         glyphs,
