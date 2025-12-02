@@ -355,6 +355,17 @@ pub(crate) struct ProcessedRun {
     pub text_range: Range<usize>,
 }
 
+impl ProcessedRun {
+    /// Take ownership of the clusters and glyphs vectors for returning to pool.
+    /// Returns (clusters, glyphs) vectors.
+    pub(crate) fn take_vecs(&mut self) -> (Vec<ClusterData>, Vec<Glyph>) {
+        (
+            core::mem::take(&mut self.clusters),
+            core::mem::take(&mut self.glyphs),
+        )
+    }
+}
+
 impl<B: Brush> Default for LayoutData<B> {
     fn default() -> Self {
         Self {
@@ -616,6 +627,9 @@ impl<B: Brush> LayoutData<B> {
 
     /// Process a glyph buffer into a `ProcessedRun` WITHOUT pushing to layout.
     /// This allows analyzing for holes before deciding how to push.
+    ///
+    /// The `cached_metrics` are computed by the shaper with LRU caching.
+    /// The `clusters` and `glyphs` vecs are provided from allocation pools.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn process_run_to_temp(
         &mut self,
@@ -630,10 +644,11 @@ impl<B: Brush> LayoutData<B> {
         source_text: &str,
         char_infos: &[(CharInfo, u16)],
         text_range: Range<usize>,
-        coords: &[harfrust::NormalizedCoord],
+        coords: &[i16],
+        cached_metrics: &crate::shape::cache::CachedMetrics,
+        mut clusters: Vec<ClusterData>,
+        mut glyphs: Vec<Glyph>,
     ) -> ProcessedRun {
-        let coords_vec: Vec<i16> = coords.iter().map(|c| c.to_bits()).collect();
-
         let font_index = self
             .fonts
             .iter()
@@ -644,59 +659,28 @@ impl<B: Brush> LayoutData<B> {
                 index
             });
 
-        let metrics = {
-            let font = &self.fonts[font_index];
-            let font_ref = skrifa::FontRef::from_index(font.data.as_ref(), font.index).unwrap();
-            skrifa::metrics::Metrics::new(&font_ref, skrifa::prelude::Size::new(font_size), coords)
-        };
-        let units_per_em = metrics.units_per_em as f32;
-
-        let run_metrics = {
-            let (underline_offset, underline_size) = if let Some(underline) = metrics.underline {
-                (underline.offset, underline.thickness)
-            } else {
-                let default = units_per_em / 18.0;
-                (default, default)
-            };
-            let (strikethrough_offset, strikethrough_size) =
-                if let Some(strikeout) = metrics.strikeout {
-                    (strikeout.offset, strikeout.thickness)
-                } else {
-                    (metrics.ascent / 2.0, units_per_em / 18.0)
-                };
-
-            let style = &self.styles[style_index as usize];
-            let line_height = match style.line_height {
-                LineHeight::Absolute(value) => value,
-                LineHeight::FontSizeRelative(value) => value * font_size,
-                LineHeight::MetricsRelative(value) => {
-                    (metrics.ascent - metrics.descent + metrics.leading) * value
-                }
-            };
-
-            RunMetrics {
-                ascent: metrics.ascent,
-                descent: -metrics.descent,
-                leading: metrics.leading,
-                underline_offset,
-                underline_size,
-                strikethrough_offset,
-                strikethrough_size,
-                line_height,
+        // Compute line height from style
+        let style = &self.styles[style_index as usize];
+        let line_height = match style.line_height {
+            LineHeight::Absolute(value) => value,
+            LineHeight::FontSizeRelative(value) => value * font_size,
+            LineHeight::MetricsRelative(value) => {
+                (cached_metrics.ascent + cached_metrics.descent + cached_metrics.leading) * value
             }
         };
+        let run_metrics = cached_metrics.to_run_metrics(line_height);
 
         let glyph_infos = glyph_buffer.glyph_infos();
         if glyph_infos.is_empty() {
             return ProcessedRun {
-                clusters: Vec::new(),
-                glyphs: Vec::new(),
+                clusters,
+                glyphs,
                 advance: 0.0,
                 metrics: run_metrics,
                 font_index,
                 font_size,
                 synthesis,
-                coords: coords_vec,
+                coords: coords.to_vec(),
                 bidi_level,
                 style_index,
                 word_spacing,
@@ -706,11 +690,8 @@ impl<B: Brush> LayoutData<B> {
         }
 
         let glyph_positions = glyph_buffer.glyph_positions();
-        let scale_factor = font_size / units_per_em;
+        let scale_factor = font_size / cached_metrics.units_per_em;
         let is_rtl = bidi_level & 1 == 1;
-
-        let mut clusters = Vec::new();
-        let mut glyphs = Vec::new();
 
         let advance = if !is_rtl {
             process_clusters(
@@ -747,7 +728,7 @@ impl<B: Brush> LayoutData<B> {
             font_index,
             font_size,
             synthesis,
-            coords: coords_vec,
+            coords: coords.to_vec(),
             bidi_level,
             style_index,
             word_spacing,

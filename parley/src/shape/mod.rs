@@ -23,27 +23,37 @@ use icu_properties::props::Script;
 
 use fontique::{self, Query, QueryFamily, QueryFont};
 
-mod cache;
+pub(crate) mod cache;
 
 pub(crate) struct ShapeContext {
     shape_data_cache: LruCache<cache::ShapeDataKey, harfrust::ShaperData>,
     shape_instance_cache: LruCache<cache::ShapeInstanceId, harfrust::ShaperInstance>,
     shape_plan_cache: LruCache<cache::ShapePlanId, harfrust::ShapePlan>,
+    metrics_cache: LruCache<cache::MetricsCacheId, cache::CachedMetrics>,
     unicode_buffer: Option<harfrust::UnicodeBuffer>,
     features: Vec<harfrust::Feature>,
     char_cluster: CharCluster,
+    // Allocation pools
+    cluster_pool: cache::VecPool<crate::layout::data::ClusterData>,
+    glyph_pool: cache::VecPool<crate::layout::Glyph>,
+    tried_fonts_pool: cache::VecPool<SelectedFont>,
 }
 
 impl Default for ShapeContext {
     fn default() -> Self {
-        const MAX_ENTRIES: usize = 16;
+        const MAX_CACHE_ENTRIES: usize = 16;
+        const MAX_POOL_SIZE: usize = 4;
         Self {
-            shape_data_cache: LruCache::new(MAX_ENTRIES),
-            shape_instance_cache: LruCache::new(MAX_ENTRIES),
-            shape_plan_cache: LruCache::new(MAX_ENTRIES),
+            shape_data_cache: LruCache::new(MAX_CACHE_ENTRIES),
+            shape_instance_cache: LruCache::new(MAX_CACHE_ENTRIES),
+            shape_plan_cache: LruCache::new(MAX_CACHE_ENTRIES),
+            metrics_cache: LruCache::new(MAX_CACHE_ENTRIES),
             unicode_buffer: Some(harfrust::UnicodeBuffer::new()),
             features: Vec::new(),
             char_cluster: CharCluster::default(),
+            cluster_pool: cache::VecPool::new(MAX_POOL_SIZE),
+            glyph_pool: cache::VecPool::new(MAX_POOL_SIZE),
+            tried_fonts_pool: cache::VecPool::new(MAX_POOL_SIZE),
         }
     }
 }
@@ -347,11 +357,10 @@ fn shape_item<'a, B: Brush>(
         let segment_infos =
             &item_infos[segment_char_start..(segment_char_start + segment_char_count)];
 
-        // Shape with the selected font
-        // Shape into ProcessedRun (without pushing to layout yet)
+        // Shape with the selected font into ProcessedRun (without pushing to layout yet)
         let segment_abs_text_range =
             (text_range.start + segment_start_offset)..(text_range.start + segment_end_offset);
-        let processed_run = shape_to_processed_run(
+        let mut processed_run = shape_to_processed_run(
             rcx,
             item,
             scx,
@@ -363,329 +372,192 @@ fn shape_item<'a, B: Brush>(
             segment_abs_text_range.clone(),
         );
 
-        // Analyze for holes
-        let analysis = crate::layout::data::LayoutData::<B>::analyze_processed_run(
-            &processed_run,
-            segment_text.len(),
+        // Analyze for holes and push, using fallback fonts for any holes
+        let mut tried_fonts = scx.tried_fonts_pool.acquire();
+        push_run_with_fallback(
+            rcx,
+            item,
+            scx,
+            layout,
+            &mut processed_run,
+            &font, // primary_font - stays constant
+            &font, // current_font - same as primary for initial call
+            fb_script,
+            segment_text,
+            segment_infos,
+            segment_abs_text_range,
+            analysis_data_sources,
+            &mut font_selector,
+            &mut tried_fonts,
+            true, // Reset tried_fonts for each sibling hole
         );
-
-        if !analysis.has_holes {
-            // No holes - push the entire run directly (preserves shaped data)
-            layout.data.push_processed_run(&processed_run);
-        } else {
-            // Has holes - process each segment
-            use crate::layout::data::ShapedSegment;
-
-            for segment in analysis.segments {
-                match segment {
-                    ShapedSegment::Shaped {
-                        cluster_range,
-                        text_range: seg_text_range,
-                    } => {
-                        // Push the shaped portion directly from ProcessedRun (no reshaping!)
-                        let abs_text_range = (segment_abs_text_range.start + seg_text_range.start)
-                            ..(segment_abs_text_range.start + seg_text_range.end);
-                        layout.data.push_processed_segment(
-                            &processed_run,
-                            cluster_range,
-                            abs_text_range,
-                        );
-                    }
-                    ShapedSegment::Hole(hole) => {
-                        // Reshape this hole with fallback fonts
-                        let hole_text = &segment_text[hole.text_range.clone()];
-                        let hole_char_start = segment_char_start + hole.char_range.start;
-                        let hole_char_end = segment_char_start + hole.char_range.end;
-                        let hole_infos = &item_infos[hole_char_start..hole_char_end];
-
-                        if !hole_text.is_empty() && !hole_infos.is_empty() {
-                            let abs_hole_range = (segment_abs_text_range.start
-                                + hole.text_range.start)
-                                ..(segment_abs_text_range.start + hole.text_range.end);
-                            shape_hole_with_fallback(
-                                rcx,
-                                item,
-                                scx,
-                                layout,
-                                &font,
-                                fb_script,
-                                hole_text,
-                                hole_infos,
-                                abs_hole_range,
-                                analysis_data_sources,
-                                &mut font_selector,
-                            );
-                        }
-                    }
-                }
-            }
-        }
+        scx.tried_fonts_pool.release(tried_fonts);
     }
 }
 
-/// Shape a hole with fallback fonts. If a fallback font also has holes,
-/// recursively process those sub-holes.
+/// Analyze a ProcessedRun for holes and push it to layout, using fallback fonts for holes.
+///
+/// This is the core logic shared between initial shaping and fallback shaping:
+/// 1. Analyze the run for holes (glyph_id == 0)
+/// 2. If no holes, push the entire run
+/// 3. If holes, push shaped segments and recursively handle holes with fallback fonts
+///
+/// - `primary_font`: The first font selected for this text (used for .notdef when no fallbacks work)
+/// - `current_font`: The font used for this particular ProcessedRun
+/// - `tried_fonts`: Tracks fonts we've already tried
+/// - `reset_per_hole`: If true, reset tried_fonts for each hole (for sibling holes at top level).
+///                     If false, accumulate tried_fonts across sub-holes (for recursive calls).
 #[allow(clippy::too_many_arguments)]
-fn shape_hole_with_fallback<'a, B: Brush>(
+fn push_run_with_fallback<'a, B: Brush>(
     rcx: &'a ResolveContext,
     item: &Item,
     scx: &mut ShapeContext,
     layout: &mut Layout<B>,
+    processed: &mut crate::layout::data::ProcessedRun,
     primary_font: &SelectedFont,
+    current_font: &SelectedFont,
     fb_script: fontique::Script,
-    hole_text: &str,
-    hole_infos: &[(CharInfo, u16)],
-    text_range: core::ops::Range<usize>,
-    analysis_data_sources: &AnalysisDataSources,
-    font_selector: &mut FontSelector<'a, '_, B>,
-) {
-    // Set up the cluster with the hole's text so the font selector can
-    // configure the query for the correct style
-    // TODO: Don't repeat this work
-    let seg_boundaries = analysis_data_sources
-        .grapheme_segmenter()
-        .segment_str(hole_text);
-    let mut seg_iter = seg_boundaries.skip(1);
-    let first_seg_boundary = seg_iter.next().unwrap_or(hole_text.len());
-
-    {
-        let mut temp_infos_iter = hole_infos.iter();
-        let mut temp_offset = text_range.start;
-        fill_cluster_in_place(
-            &hole_text[0..first_seg_boundary],
-            &mut temp_infos_iter,
-            &mut temp_offset,
-            &mut scx.char_cluster,
-        );
-    }
-
-    // First call select_font to configure the query for this style
-    let _ = font_selector.select_font(&mut scx.char_cluster);
-
-    // Now find a fallback font (skip the primary font we already tried)
-    let tried_fonts = vec![primary_font.clone()];
-    let fallback = font_selector.select_next_font(&tried_fonts);
-
-    match fallback {
-        Some(fallback_font) => {
-            // Shape with fallback font into ProcessedRun (preserves shaped data)
-            let processed = shape_to_processed_run(
-                rcx,
-                item,
-                scx,
-                layout,
-                &fallback_font,
-                fb_script,
-                hole_text,
-                hole_infos,
-                text_range.clone(),
-            );
-
-            let analysis = crate::layout::data::LayoutData::<B>::analyze_processed_run(
-                &processed,
-                hole_text.len(),
-            );
-
-            if !analysis.has_holes {
-                // Fallback worked! Push the entire run
-                layout.data.push_processed_run(&processed);
-            } else {
-                // Fallback also has holes - process segments
-                use crate::layout::data::ShapedSegment;
-
-                let mut tried_fonts = vec![primary_font.clone(), fallback_font.clone()];
-
-                for segment in analysis.segments {
-                    match segment {
-                        ShapedSegment::Shaped {
-                            cluster_range,
-                            text_range: seg_text_range,
-                        } => {
-                            // Push shaped portion directly (no reshaping!)
-                            let abs_range = (text_range.start + seg_text_range.start)
-                                ..(text_range.start + seg_text_range.end);
-
-                            layout.data.push_processed_segment(
-                                &processed,
-                                cluster_range,
-                                abs_range,
-                            );
-                        }
-                        ShapedSegment::Hole(hole) => {
-                            // Recursively process sub-hole
-                            let sub_hole_text = &hole_text[hole.text_range.clone()];
-                            let sub_hole_infos = &hole_infos[hole.char_range.clone()];
-
-                            if !sub_hole_text.is_empty() && !sub_hole_infos.is_empty() {
-                                let abs_range = (text_range.start + hole.text_range.start)
-                                    ..(text_range.start + hole.text_range.end);
-                                shape_hole_with_fallback_tried(
-                                    rcx,
-                                    item,
-                                    scx,
-                                    layout,
-                                    primary_font,
-                                    fb_script,
-                                    sub_hole_text,
-                                    sub_hole_infos,
-                                    abs_range,
-                                    analysis_data_sources,
-                                    font_selector,
-                                    &mut tried_fonts,
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        None => {
-            // No fallback - shape with primary font for .notdef glyphs
-            let processed = shape_to_processed_run(
-                rcx,
-                item,
-                scx,
-                layout,
-                primary_font,
-                fb_script,
-                hole_text,
-                hole_infos,
-                text_range,
-            );
-            layout.data.push_processed_run(&processed);
-        }
-    }
-}
-
-/// Shape a hole with fallback fonts, given a list of already-tried fonts.
-#[allow(clippy::too_many_arguments)]
-fn shape_hole_with_fallback_tried<'a, B: Brush>(
-    rcx: &'a ResolveContext,
-    item: &Item,
-    scx: &mut ShapeContext,
-    layout: &mut Layout<B>,
-    primary_font: &SelectedFont,
-    fb_script: fontique::Script,
-    hole_text: &str,
-    hole_infos: &[(CharInfo, u16)],
+    segment_text: &str,
+    segment_infos: &[(CharInfo, u16)],
     text_range: core::ops::Range<usize>,
     analysis_data_sources: &AnalysisDataSources,
     font_selector: &mut FontSelector<'a, '_, B>,
     tried_fonts: &mut Vec<SelectedFont>,
+    reset_per_hole: bool,
 ) {
-    // Set up the cluster with the hole's text so the font selector can
-    // configure the query for the correct style
-    let seg_boundaries = analysis_data_sources
-        .grapheme_segmenter()
-        .segment_str(hole_text);
-    let mut seg_iter = seg_boundaries.skip(1);
-    let first_seg_boundary = seg_iter.next().unwrap_or(hole_text.len());
+    use crate::layout::data::ShapedSegment;
 
-    {
-        let mut temp_infos_iter = hole_infos.iter();
-        let mut temp_offset = text_range.start;
-        fill_cluster_in_place(
-            &hole_text[0..first_seg_boundary],
-            &mut temp_infos_iter,
-            &mut temp_offset,
-            &mut scx.char_cluster,
-        );
-    }
+    let analysis =
+        crate::layout::data::LayoutData::<B>::analyze_processed_run(processed, segment_text.len());
 
-    // First call select_font to configure the query for this style
-    let _ = font_selector.select_font(&mut scx.char_cluster);
+    if !analysis.has_holes {
+        // No holes - push the entire run
+        layout.data.push_processed_run(processed);
+    } else {
+        // Process each segment
+        for segment in analysis.segments {
+            match segment {
+                ShapedSegment::Shaped {
+                    cluster_range,
+                    text_range: seg_text_range,
+                } => {
+                    // Push shaped portion directly (no reshaping!)
+                    let abs_range = (text_range.start + seg_text_range.start)
+                        ..(text_range.start + seg_text_range.end);
+                    layout
+                        .data
+                        .push_processed_segment(processed, cluster_range, abs_range);
+                }
+                ShapedSegment::Hole(hole) => {
+                    // Get hole text and infos
+                    let hole_text = &segment_text[hole.text_range.clone()];
+                    let hole_infos = &segment_infos[hole.char_range.clone()];
 
-    // Now select next fallback font (skip fonts we've already tried)
-    let fallback = font_selector.select_next_font(tried_fonts);
+                    if hole_text.is_empty() || hole_infos.is_empty() {
+                        continue;
+                    }
 
-    match fallback {
-        Some(fallback_font) => {
-            // Shape with fallback font into ProcessedRun (preserves shaped data)
-            let processed = shape_to_processed_run(
-                rcx,
-                item,
-                scx,
-                layout,
-                &fallback_font,
-                fb_script,
-                hole_text,
-                hole_infos,
-                text_range.clone(),
-            );
+                    let abs_hole_range = (text_range.start + hole.text_range.start)
+                        ..(text_range.start + hole.text_range.end);
 
-            let analysis = crate::layout::data::LayoutData::<B>::analyze_processed_run(
-                &processed,
-                hole_text.len(),
-            );
+                    // Reset tried_fonts for each sibling hole at top level
+                    if reset_per_hole {
+                        tried_fonts.clear();
+                        tried_fonts.push(current_font.clone());
+                    }
 
-            if !analysis.has_holes {
-                // Fallback worked! Push the entire run
-                layout.data.push_processed_run(&processed);
-            } else {
-                // Still has holes - process segments
-                use crate::layout::data::ShapedSegment;
+                    // Configure font selector for this hole's style
+                    let seg_boundaries = analysis_data_sources
+                        .grapheme_segmenter()
+                        .segment_str(hole_text);
+                    let mut seg_iter = seg_boundaries.skip(1);
+                    let first_seg_boundary = seg_iter.next().unwrap_or(hole_text.len());
 
-                tried_fonts.push(fallback_font.clone());
+                    let mut temp_infos_iter = hole_infos.iter();
+                    let mut temp_offset = abs_hole_range.start;
+                    fill_cluster_in_place(
+                        &hole_text[0..first_seg_boundary],
+                        &mut temp_infos_iter,
+                        &mut temp_offset,
+                        &mut scx.char_cluster,
+                    );
 
-                for segment in analysis.segments {
-                    match segment {
-                        ShapedSegment::Shaped {
-                            cluster_range,
-                            text_range: seg_text_range,
-                        } => {
-                            // Push shaped portion directly (no reshaping!)
-                            let abs_range = (text_range.start + seg_text_range.start)
-                                ..(text_range.start + seg_text_range.end);
-                            layout.data.push_processed_segment(
-                                &processed,
-                                cluster_range,
-                                abs_range,
+                    // Call select_font to configure the query for this style
+                    let _ = font_selector.select_font(&mut scx.char_cluster);
+
+                    // Find next fallback font
+                    let fallback = font_selector.select_next_font(tried_fonts);
+
+                    match fallback {
+                        Some(fallback_font) => {
+                            // Shape with fallback font
+                            let mut fallback_processed = shape_to_processed_run(
+                                rcx,
+                                item,
+                                scx,
+                                layout,
+                                &fallback_font,
+                                fb_script,
+                                hole_text,
+                                hole_infos,
+                                abs_hole_range.clone(),
                             );
-                        }
-                        ShapedSegment::Hole(hole) => {
-                            // Recursively process sub-hole
-                            let sub_hole_text = &hole_text[hole.text_range.clone()];
-                            let sub_hole_infos = &hole_infos[hole.char_range.clone()];
 
-                            if !sub_hole_text.is_empty() && !sub_hole_infos.is_empty() {
-                                let abs_range = (text_range.start + hole.text_range.start)
-                                    ..(text_range.start + hole.text_range.end);
-                                shape_hole_with_fallback_tried(
-                                    rcx,
-                                    item,
-                                    scx,
-                                    layout,
-                                    primary_font,
-                                    fb_script,
-                                    sub_hole_text,
-                                    sub_hole_infos,
-                                    abs_range,
-                                    analysis_data_sources,
-                                    font_selector,
-                                    tried_fonts,
-                                );
-                            }
+                            // Track that we tried this font
+                            tried_fonts.push(fallback_font.clone());
+
+                            // Recursively process sub-holes (don't reset per hole)
+                            push_run_with_fallback(
+                                rcx,
+                                item,
+                                scx,
+                                layout,
+                                &mut fallback_processed,
+                                primary_font,
+                                &fallback_font,
+                                fb_script,
+                                hole_text,
+                                hole_infos,
+                                abs_hole_range.clone(),
+                                analysis_data_sources,
+                                font_selector,
+                                tried_fonts,
+                                false, // Don't reset for sub-holes
+                            );
+
+                            // Return fallback vecs to pool
+                            let (clusters, glyphs) = fallback_processed.take_vecs();
+                            scx.cluster_pool.release(clusters);
+                            scx.glyph_pool.release(glyphs);
+                        }
+                        None => {
+                            // No more fallbacks - shape with primary font for .notdef glyphs
+                            let mut notdef_processed = shape_to_processed_run(
+                                rcx,
+                                item,
+                                scx,
+                                layout,
+                                primary_font,
+                                fb_script,
+                                hole_text,
+                                hole_infos,
+                                abs_hole_range,
+                            );
+                            layout.data.push_processed_run(&notdef_processed);
+                            let (clusters, glyphs) = notdef_processed.take_vecs();
+                            scx.cluster_pool.release(clusters);
+                            scx.glyph_pool.release(glyphs);
                         }
                     }
                 }
             }
         }
-        None => {
-            // No more fallbacks - shape with primary font for .notdef glyphs
-            let processed = shape_to_processed_run(
-                rcx,
-                item,
-                scx,
-                layout,
-                primary_font,
-                fb_script,
-                hole_text,
-                hole_infos,
-                text_range,
-            );
-            layout.data.push_processed_run(&processed);
-        }
     }
+
+    // Return main run's vecs to pool
+    let (clusters, glyphs) = processed.take_vecs();
+    scx.cluster_pool.release(clusters);
+    scx.glyph_pool.release(glyphs);
 }
 
 /// Shape a text segment with a specific font into a ProcessedRun (without pushing to layout).
@@ -791,6 +663,54 @@ fn shape_to_processed_run<B: Brush>(
         (glyph_buffer, coords)
     };
 
+    // Get cached metrics or compute them (no allocation for lookup)
+    let metrics_key =
+        cache::MetricsCacheKey::new(font.font.blob.id(), font.font.index, item.size, &coords);
+    let cached_metrics = scx.metrics_cache.entry(metrics_key, || {
+        let skrifa_font = skrifa::FontRef::from_index(font.font.blob.as_ref(), font.font.index)
+            .expect("failed to create skrifa font ref");
+        // Convert coords to skrifa's expected format
+        let skrifa_coords: Vec<skrifa::instance::NormalizedCoord> = coords
+            .iter()
+            .map(|c| skrifa::instance::NormalizedCoord::from_bits(c.to_bits()))
+            .collect();
+        let metrics = skrifa::metrics::Metrics::new(
+            &skrifa_font,
+            skrifa::prelude::Size::new(item.size),
+            skrifa_coords.as_slice(),
+        );
+        let units_per_em = metrics.units_per_em as f32;
+        let (underline_offset, underline_size) = if let Some(underline) = metrics.underline {
+            (underline.offset, underline.thickness)
+        } else {
+            let default = units_per_em / 18.0;
+            (default, default)
+        };
+        let (strikethrough_offset, strikethrough_size) = if let Some(strikeout) = metrics.strikeout
+        {
+            (strikeout.offset, strikeout.thickness)
+        } else {
+            (metrics.ascent / 2.0, units_per_em / 18.0)
+        };
+        cache::CachedMetrics {
+            units_per_em,
+            ascent: metrics.ascent,
+            descent: -metrics.descent,
+            leading: metrics.leading,
+            underline_offset,
+            underline_size,
+            strikethrough_offset,
+            strikethrough_size,
+        }
+    });
+
+    // Convert coords to i16 for storage (only allocate here, not for lookup)
+    let coords_i16: Vec<i16> = coords.iter().map(|c| c.to_bits()).collect();
+
+    // Acquire vectors from pools
+    let clusters = scx.cluster_pool.acquire();
+    let glyphs = scx.glyph_pool.acquire();
+
     // Process to temp storage (don't push yet)
     let processed = layout.data.process_run_to_temp(
         FontData::new(font.font.blob.clone(), font.font.index),
@@ -804,7 +724,10 @@ fn shape_to_processed_run<B: Brush>(
         segment_text,
         segment_infos,
         text_range,
-        &coords,
+        &coords_i16,
+        cached_metrics,
+        clusters,
+        glyphs,
     );
 
     // Return buffer to context
