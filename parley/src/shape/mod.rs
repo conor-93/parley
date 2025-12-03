@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 use super::layout::Layout;
 use super::resolve::{RangedStyle, ResolveContext, Resolved};
 use super::style::{Brush, FontFeature, FontVariation};
-use crate::analysis::cluster::{Char, CharCluster};
+use crate::analysis::cluster::CharCluster;
 use crate::analysis::{AnalysisDataSources, CharInfo};
 use crate::icu_convert::script_to_harfrust;
 use crate::inline_box::InlineBox;
@@ -238,37 +238,29 @@ fn fill_cluster_in_place(
     char_cluster: &mut CharCluster,
 ) {
     // Reset cluster but keep allocation
+    // TODO: Remove force normalise from info.
     char_cluster.clear();
 
-    let mut force_normalize = false;
+    let mut cluster_style_index = u16::MAX;
     let mut is_emoji_or_pictograph = false;
     let start = *code_unit_offset_in_string as u32;
 
     for ((_, ch), (info, style_index)) in segment_text.char_indices().zip(item_infos_iter.by_ref())
     {
-        force_normalize |= info.force_normalize();
+        cluster_style_index = *style_index;
         // TODO - make emoji detection more complete, as per (except using composite Trie tables as
         //  much as possible:
         //  https://github.com/conor-93/parley/blob/4637d826732a1a82bbb3c904c7f47a16a21cceec/parley/src/shape/mod.rs#L221-L269
         is_emoji_or_pictograph |= info.is_emoji_or_pictograph();
         *code_unit_offset_in_string += ch.len_utf8();
-
-        char_cluster.chars.push(Char {
-            ch,
-            contributes_to_shaping: info.contributes_to_shaping(),
-            glyph_id: 0,
-            style_index: *style_index,
-            is_control_character: info.is_control(),
-        });
     }
 
     // Finalize cluster metadata
     let end = *code_unit_offset_in_string as u32;
     char_cluster.is_emoji = is_emoji_or_pictograph;
-    char_cluster.map_len = 0;
+    char_cluster.style_index = cluster_style_index;
     char_cluster.start = start;
     char_cluster.end = end;
-    char_cluster.force_normalize = force_normalize;
 }
 
 fn shape_item<'a, B: Brush>(
