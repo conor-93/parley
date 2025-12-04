@@ -375,8 +375,9 @@ fn shape_item<'a, B: Brush>(
             scx,
             layout,
             &mut processed_run,
-            &font, // primary_font - stays constant
-            &font, // current_font - same as primary for initial call
+            &font,
+            // Initial call uses primary font as current font
+            &font,
             fb_script,
             segment_text,
             segment_infos,
