@@ -399,12 +399,9 @@ fn shape_item<'a, B: Brush>(
 /// 2. If no holes, push the entire run
 /// 3. If holes, push shaped segments and recursively handle holes with fallback fonts
 ///
-/// - `primary_font`: The first font selected for this text (used for .notdef when no fallbacks work)
-/// - `current_font`: The font used for this particular ProcessedRun
-/// - `tried_fonts`: Tracks fonts we've already tried
-/// - `holes`: Scratch space for hole detection (pooled allocation)
-/// - `reset_per_hole`: If true, reset tried_fonts for each hole (for sibling holes at top level).
-///                     If false, accumulate tried_fonts across sub-holes (for recursive calls).
+/// reset_per_hole:
+///     If true, reset tried_fonts for each hole (for sibling holes at top level).
+///     If false, accumulate tried_fonts across sub-holes (for recursive calls).
 #[allow(clippy::too_many_arguments)]
 fn push_run_with_fallback<'a, B: Brush>(
     rcx: &'a ResolveContext,
@@ -443,7 +440,7 @@ fn push_run_with_fallback<'a, B: Brush>(
                     cluster_range,
                     text_range: seg_text_range,
                 } => {
-                    // Push shaped portion directly (no reshaping!)
+                    // Push shaped portion
                     let abs_range = (text_range.start + seg_text_range.start)
                         ..(text_range.start + seg_text_range.end);
                     layout
@@ -484,7 +481,7 @@ fn push_run_with_fallback<'a, B: Brush>(
                         &mut scx.char_cluster,
                     );
 
-                    // Call select_font to configure the query for this style
+                    // Call select_font to configure query
                     let _ = font_selector.select_font(&mut scx.char_cluster);
 
                     // Find next fallback font
@@ -505,10 +502,9 @@ fn push_run_with_fallback<'a, B: Brush>(
                                 abs_hole_range.clone(),
                             );
 
-                            // Track that we tried this font
                             tried_fonts.push(fallback_font.clone());
 
-                            // Recursively process sub-holes (don't reset per hole)
+                            // Recursively process sub-holes
                             push_run_with_fallback(
                                 rcx,
                                 item,
@@ -525,7 +521,7 @@ fn push_run_with_fallback<'a, B: Brush>(
                                 font_selector,
                                 tried_fonts,
                                 holes,
-                                false, // Don't reset for sub-holes
+                                false,
                             );
 
                             // Return fallback vecs to pool
@@ -815,12 +811,9 @@ impl<'a, 'b, B: Brush> FontSelector<'a, 'b, B> {
         }
     }
 
-    /// Select a font for the given cluster, checking character coverage.
-    /// Used for initial font selection where we want to pick a font that can render the text.
-    /// Select a font based on style attributes and character coverage.
-    /// Select a font based on style attributes.
-    /// Does NOT check character coverage - the shaper will tell us which characters
-    /// couldn't be rendered (glyph_id == 0), and we handle those as holes.
+    /// Select a font for the given cluster.
+    ///
+    /// Does not check character coverage.
     fn select_font(&mut self, cluster: &mut CharCluster) -> Option<SelectedFont> {
         let style_index = cluster.style_index();
         let is_emoji = cluster.is_emoji;
@@ -855,7 +848,6 @@ impl<'a, 'b, B: Brush> FontSelector<'a, 'b, B> {
         }
 
         // Just return the first matching font - no coverage checking.
-        // The shaper will tell us which characters couldn't be rendered.
         let mut selected_font = None;
         self.query.matches_with(|font| {
             selected_font = Some(font.into());
@@ -865,8 +857,6 @@ impl<'a, 'b, B: Brush> FontSelector<'a, 'b, B> {
     }
 
     /// Select the next font in the fallback chain, skipping any fonts we've already tried.
-    /// Unlike `select_font`, this doesn't check character coverage - the shaper already
-    /// told us which characters couldn't be rendered (glyph_id == 0).
     fn select_next_font(&mut self, skip_fonts: &[SelectedFont]) -> Option<SelectedFont> {
         let mut selected_font = None;
         self.query.matches_with(|font| {

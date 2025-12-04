@@ -356,8 +356,7 @@ pub(crate) struct ProcessedRun {
 }
 
 impl ProcessedRun {
-    /// Take ownership of the clusters and glyphs vectors for returning to pool.
-    /// Returns (clusters, glyphs) vectors.
+    /// Take allocations for later reuse.
     pub(crate) fn take_vecs(&mut self) -> (Vec<ClusterData>, Vec<Glyph>) {
         (
             core::mem::take(&mut self.clusters),
@@ -426,12 +425,8 @@ impl<B: Brush> LayoutData<B> {
         });
     }
 
-    /// Process a glyph buffer into a `ProcessedRun` WITHOUT pushing to layout.
+    /// Process a glyph buffer into a `ProcessedRun` without pushing to layout.
     /// This allows analyzing for holes before deciding how to push.
-    ///
-    /// The `cached_metrics` are computed by the shaper with LRU caching.
-    /// The `clusters` and `glyphs` vecs are provided from allocation pools.
-    /// The `coords` are passed by ownership to avoid cloning.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn process_run_to_temp(
         &mut self,
@@ -615,7 +610,6 @@ impl<B: Brush> LayoutData<B> {
         let cluster_range_start = self.clusters.len();
         let glyph_start = self.glyphs.len();
 
-        // Copy the relevant clusters and glyphs
         let segment_clusters = &run.clusters[segment_cluster_range.clone()];
 
         // Calculate glyph range from cluster data
@@ -633,9 +627,7 @@ impl<B: Brush> LayoutData<B> {
             }
         }
 
-        // Copy glyphs and adjust cluster glyph offsets
         let glyph_base_offset = if min_glyph_offset < usize::MAX {
-            // Copy the relevant glyphs
             self.glyphs
                 .extend_from_slice(&run.glyphs[min_glyph_offset..max_glyph_end]);
             min_glyph_offset
@@ -800,14 +792,15 @@ impl<B: Brush> LayoutData<B> {
 }
 
 /// Detects holes (clusters with glyph_id == 0) in the processed clusters.
-/// This is called after clusters are in logical order, so it works correctly for both LTR and RTL.
 ///
 /// Returns a list of holes, where each hole is a contiguous range of clusters that have
 /// glyph_id == 0 (meaning the font couldn't render those characters).
 ///
-/// **Important**: Combining marks are always included with their preceding base character's hole,
+/// Combining marks are always included with their preceding base character's hole,
 /// even if the font claims to support the mark in isolation. This ensures proper rendering
 /// of composed characters like Arabic letters with diacritics.
+///
+/// Marks are detected as glyphs with 0 advance.
 ///
 /// Note: `glyphs` should be the slice of glyphs for this run only (not the entire layout).
 /// The `holes` vec is cleared at the start and filled with detected holes.
@@ -819,6 +812,7 @@ fn detect_holes(clusters: &[ClusterData], glyphs: &[Glyph], holes: &mut Vec<Hole
 
     // First pass: determine which clusters are holes, handling ligature components.
     // A ligature component (glyph_len=0) is a hole if its "owner" cluster is a hole.
+    // TODO: Reuse allocation.
     let mut is_hole_vec: Vec<bool> = Vec::with_capacity(clusters.len());
 
     for cluster in clusters.iter() {
@@ -826,13 +820,15 @@ fn detect_holes(clusters: &[ClusterData], glyphs: &[Glyph], holes: &mut Vec<Hole
     }
 
     // Handle ligature components: if cluster[i] has glyph_len=0, it's part of a ligature/combining sequence.
-    // The "owner" cluster (the one with the actual glyphs) could be before OR after this cluster:
-    // - LTR ligatures (e.g., "fi"): owner ('f') comes BEFORE component ('i')
-    // - Arabic combining marks: owner (fatha) might come AFTER base (alef)
-    // We look in both directions to find the nearest owner.
+    // The "owner" cluster (the one with the actual glyphs) could be before OR after this cluster
+    // depending on LTR or RTL.
+    //
+    // TODO: I think this code isn't correct and can be improved significantly.
     for i in 0..clusters.len() {
         if clusters[i].glyph_len == 0 {
-            // Look backward first (for LTR ligatures)
+            // TODO: Fix this code
+
+            // Look backward
             let mut found = false;
             if i > 0 {
                 for j in (0..i).rev() {
@@ -843,8 +839,9 @@ fn detect_holes(clusters: &[ClusterData], glyphs: &[Glyph], holes: &mut Vec<Hole
                     }
                 }
             }
-            // TODO: This isn't required
-            // If not found backward, look forward (for combining marks)
+            // TODO: Not sure if this isn't required
+
+            // Look forward
             if !found {
                 for j in (i + 1)..clusters.len() {
                     if clusters[j].glyph_len != 0 {
@@ -1063,9 +1060,6 @@ fn process_clusters<I: Iterator<Item = (usize, char)>>(
                     );
                 }
             }
-            // Hole tracking is currently disabled.
-            // TODO: Re-enable once RTL handling is properly implemented.
-
             cluster_start_char = char_indices_iter.next().unwrap();
 
             cluster_advance = 0.0;
