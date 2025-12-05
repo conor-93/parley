@@ -2,8 +2,130 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 use crate::FontVariation;
+use crate::layout::RunMetrics;
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 use hashbrown::Equivalent;
+
+/// Cached font metrics to avoid repeated computation.
+#[derive(Clone)]
+pub(crate) struct CachedMetrics {
+    pub units_per_em: f32,
+    pub ascent: f32,
+    pub descent: f32,
+    pub leading: f32,
+    pub underline_offset: f32,
+    pub underline_size: f32,
+    pub strikethrough_offset: f32,
+    pub strikethrough_size: f32,
+}
+
+impl CachedMetrics {
+    /// Convert to RunMetrics with the given line height.
+    pub(crate) fn to_run_metrics(&self, line_height: f32) -> RunMetrics {
+        RunMetrics {
+            ascent: self.ascent,
+            descent: self.descent,
+            leading: self.leading,
+            underline_offset: self.underline_offset,
+            underline_size: self.underline_size,
+            strikethrough_offset: self.strikethrough_offset,
+            strikethrough_size: self.strikethrough_size,
+            line_height,
+        }
+    }
+}
+
+/// Cache key for font metrics (font + size + variations).
+#[derive(PartialEq, Clone)]
+pub(crate) struct MetricsCacheId {
+    font_blob_id: u64,
+    font_index: u32,
+    font_size_bits: u32, // f32 as bits for equality
+    coords: Box<[i16]>,
+}
+
+/// Borrowed key for looking up cached metrics.
+/// Uses harfrust coords directly to avoid allocation during lookup.
+pub(crate) struct MetricsCacheKey<'a> {
+    font_blob_id: u64,
+    font_index: u32,
+    font_size_bits: u32,
+    coords: &'a [harfrust::NormalizedCoord],
+}
+
+impl<'a> MetricsCacheKey<'a> {
+    pub(crate) fn new(
+        font_blob_id: u64,
+        font_index: u32,
+        font_size: f32,
+        coords: &'a [harfrust::NormalizedCoord],
+    ) -> Self {
+        Self {
+            font_blob_id,
+            font_index,
+            font_size_bits: font_size.to_bits(),
+            coords,
+        }
+    }
+}
+
+impl<'a> Equivalent<MetricsCacheId> for MetricsCacheKey<'a> {
+    #[inline(always)]
+    fn equivalent(&self, key: &MetricsCacheId) -> bool {
+        self.font_blob_id == key.font_blob_id
+            && self.font_index == key.font_index
+            && self.font_size_bits == key.font_size_bits
+            && self.coords.len() == key.coords.len()
+            && self
+                .coords
+                .iter()
+                .zip(key.coords.iter())
+                .all(|(a, b)| a.to_bits() == *b)
+    }
+}
+
+impl<'a> From<MetricsCacheKey<'a>> for MetricsCacheId {
+    #[inline(always)]
+    fn from(key: MetricsCacheKey<'a>) -> Self {
+        Self {
+            font_blob_id: key.font_blob_id,
+            font_index: key.font_index,
+            font_size_bits: key.font_size_bits,
+            // Only allocate when inserting into cache
+            coords: key.coords.iter().map(|c| c.to_bits()).collect(),
+        }
+    }
+}
+
+/// Pool for reusing Vec allocations when processing runs.
+pub(crate) struct VecPool<T> {
+    pool: Vec<Vec<T>>,
+    max_size: usize,
+}
+
+impl<T> VecPool<T> {
+    /// Create a new pool with the specified maximum size.
+    pub(crate) fn new(max_size: usize) -> Self {
+        Self {
+            pool: Vec::new(),
+            max_size,
+        }
+    }
+
+    /// Acquire a Vec from the pool, or create a new one if empty.
+    pub(crate) fn acquire(&mut self) -> Vec<T> {
+        self.pool.pop().unwrap_or_default()
+    }
+
+    /// Return a Vec to the pool for reuse. The Vec is cleared before storing.
+    pub(crate) fn release(&mut self, mut vec: Vec<T>) {
+        vec.clear();
+        if self.pool.len() < self.max_size {
+            self.pool.push(vec);
+        }
+    }
+}
 
 #[derive(PartialEq, Copy, Clone)]
 pub(crate) struct ShapeDataKey {
