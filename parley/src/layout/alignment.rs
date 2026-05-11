@@ -104,19 +104,45 @@ fn align_impl<B: Brush, const UNDO_JUSTIFICATION: bool>(
     for line in &mut layout.lines {
         let indent = line.indent;
 
+        // Hanging whitespace is an alignment/positioning concern, orthogonal to text
+        // directionality. The RTL handling here doesn't interact with bidi reordering:
+        // it simply shifts the line's origin so that hung trailing whitespace (which
+        // sits at the *start* edge in visual order for RTL) overflows into the start
+        // margin rather than displacing visible content.
         if is_rtl {
-            // In RTL text, trailing whitespace is on the left. As we hang that whitespace, offset
-            // the line to the left. Note: indent is not subtracted here because `free_space` below
-            // already accounts for it.
             line.metrics.offset = -line.metrics.trailing_whitespace;
         } else {
             line.metrics.offset = indent;
         }
 
         // Compute free space.
-        let line_width = line.metrics.inline_max_coord - line.metrics.inline_min_coord;
-        let free_space =
-            line_width - indent - line.metrics.advance + line.metrics.trailing_whitespace;
+        // `line.metrics.inline_max_coord - line.metrics.inline_min_coord` = width of line
+        let pre_hang_free_space = line.metrics.inline_max_coord - line.metrics.inline_min_coord - indent - line.metrics.advance;
+
+        // CSS Text 3 conditional vs. unconditional hanging of trailing whitespace.
+        //
+        // Per https://www.w3.org/TR/css-text-3/#white-space-phase-2, a sequence of
+        // preserved trailing spaces at the end of a line is:
+        //  - "unconditionally hung" at soft wrap opportunities — the whitespace is
+        //     excluded from the line's measured width, so alignment/justification
+        //     ignores it (it visually overflows into the end margin).
+        //  - "conditionally hung" at forced line breaks and at the end of the
+        //     block (i.e. the paragraph-final line) — the whitespace is measured
+        //     as normal, and only hangs if it would otherwise overflow the line
+        //     box. In practice this means: include it in alignment calculations,
+        //     and clamp free_space to 0 on overflow so visible content stops at
+        //     the start edge rather than being pushed past it.
+        //
+        // `BreakReason::Explicit` covers forced breaks (e.g. `\n`);
+        // `BreakReason::None` covers the final line of the block.
+        // Both get the conditional-hanging treatment.
+        let free_space = if matches!(line.break_reason, BreakReason::Explicit | BreakReason::None) {
+            // Include trailing whitespace; clamp to 0 when it overflows.
+            pre_hang_free_space.max(0.0)
+        } else {
+            // Non-paragraph-final: unconditional hanging (trailing whitespace excluded)
+            pre_hang_free_space + line.metrics.trailing_whitespace
+        };
 
         if !options.align_when_overflowing && free_space <= 0.0 {
             if is_rtl {
@@ -143,12 +169,22 @@ fn align_impl<B: Brush, const UNDO_JUSTIFICATION: bool>(
                 }
 
                 // Justified alignment doesn't apply to the last line of a paragraph
-                // (`BreakReason::None`), (`BreakReason::Explicit`) or if there are no whitespace
-                // gaps to adjust. In that case, start-align, i.e., left-align for LTR text and
-                // right-align for RTL text.
-                if matches!(line.break_reason, BreakReason::None | BreakReason::Explicit)
-                    || line.num_spaces == 0
-                {
+                // (`BreakReason::None`), (`BreakReason::Explicit`). In that case, start-align,
+                // i.e., left-align for LTR text and right-align for RTL text.
+                if matches!(line.break_reason, BreakReason::None | BreakReason::Explicit) {
+                    if is_rtl {
+                        line.metrics.offset += free_space;
+                    }
+                    continue;
+                }
+
+                // Spaces that participate in justification: total spaces on the line minus
+                // trailing spaces (which are hung and should not receive extra width).
+                // Both counts are pre-computed during line breaking.
+                let justifiable_spaces = line.total_spaces
+                    .saturating_sub(line.trailing_space_count);
+
+                if justifiable_spaces == 0 {
                     if is_rtl {
                         line.metrics.offset += free_space;
                     }
@@ -156,7 +192,7 @@ fn align_impl<B: Brush, const UNDO_JUSTIFICATION: bool>(
                 }
 
                 let adjustment =
-                    free_space / line.num_spaces as f32 * if UNDO_JUSTIFICATION { -1. } else { 1. };
+                    free_space / justifiable_spaces as f32 * if UNDO_JUSTIFICATION { -1. } else { 1. };
                 let mut applied = 0;
                 // Iterate over text runs in the line and clusters in the text run
                 //   - Iterate forwards for even bidi levels (which represent LTR runs)
@@ -178,7 +214,7 @@ fn align_impl<B: Brush, const UNDO_JUSTIFICATION: bool>(
                                 &mut clusters.iter_mut()
                             };
                         clusters.for_each(|cluster| {
-                            if applied == line.num_spaces {
+                            if applied == justifiable_spaces {
                                 return;
                             }
                             if cluster.info.whitespace().is_space_or_nbsp() {

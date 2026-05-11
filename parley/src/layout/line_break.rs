@@ -11,7 +11,6 @@ use core_maths::CoreFloat;
 
 use crate::analysis::Boundary;
 use crate::analysis::cluster::Whitespace;
-use crate::data::ClusterData;
 use crate::layout::{
     BreakReason, Layout, LayoutData, LayoutItem, LayoutItemKind, LineData, LineItemData,
     LineMetrics, Run,
@@ -651,10 +650,24 @@ impl<'a, B: Brush> BreakLines<'a, B> {
                                     return self.max_height_break_data(line_height);
                                 }
                                 self.state.append_cluster_to_line(next_x, line_height);
-                                if try_commit_line!(BreakReason::Regular) {
-                                    // TODO: can this be hoisted out of the conditional?
+                                self.state.line.num_spaces += 1;
+                                // CSS conditional hanging: trailing whitespace before a forced
+                                // break (or end of text) should not cause line wrapping. Only
+                                // wrap if there is visible content before the next forced break.
+                                if self.has_visible_content_before_forced_break(
+                                    self.state.cluster_idx + 1,
+                                    self.state.item_idx,
+                                    cluster_end,
+                                ) {
+                                    // Mid-paragraph: hang overflowing whitespace and wrap
+                                    if try_commit_line!(BreakReason::Regular) {
+                                        // TODO: can this be hoisted out of the conditional?
+                                        self.state.cluster_idx += 1;
+                                        return self.start_new_line(BreakReason::Regular);
+                                    }
+                                } else {
+                                    // Paragraph-final: accumulate space without wrapping
                                     self.state.cluster_idx += 1;
-                                    return self.start_new_line(BreakReason::Regular);
                                 }
                             }
                             // Case: we have previously encountered a REGULAR line-breaking opportunity in the current line
@@ -1029,31 +1042,34 @@ impl<'a, B: Brush> BreakLines<'a, B> {
             reorder_line_items(&mut self.lines.line_items[line.item_range.clone()]);
         }
 
-        // Compute size of line's trailing whitespace. "Trailing" is considered the right edge
-        // for LTR text and the left edge for RTL text.
-        let run = if self.layout.is_rtl() {
+        // Compute trailing whitespace advance and count.
+        //
+        // "Trailing" means the line's end edge: last item for LTR base direction, first for RTL.
+        // Within that item, clusters are iterated from the logical end (`.rev()`), skipping any
+        // newline cluster (zero-advance forced break) to reach the hangable space/nbsp sequence.
+        //
+        // This measurement is direction-independent because UAX#9 assigns trailing whitespace
+        // the paragraph's base embedding level — trailing spaces always end up in a run matching
+        // the base direction, so iterating from the logical end of that run is correct regardless
+        // of whether the base is LTR or RTL.
+        let trailing_run = if self.layout.is_rtl() {
             self.lines.line_items[line.item_range.clone()].first()
         } else {
             self.lines.line_items[line.item_range.clone()].last()
         };
-        line.metrics.trailing_whitespace = run
+        let (trailing_ws_advance, trailing_ws_count) = trailing_run
             .filter(|item| item.is_text_run() && item.has_trailing_whitespace)
             .map(|run| {
-                fn whitespace_advance<'c, I: Iterator<Item = &'c ClusterData>>(clusters: I) -> f32 {
-                    clusters
-                        .take_while(|cluster| cluster.info.whitespace() != Whitespace::None)
-                        .map(|cluster| cluster.advance)
-                        .sum()
-                }
-
-                let clusters = &self.layout.data.clusters[run.cluster_range.clone()];
-                if run.is_rtl() {
-                    whitespace_advance(clusters.iter())
-                } else {
-                    whitespace_advance(clusters.iter().rev())
-                }
+                self.layout.data.clusters[run.cluster_range.clone()]
+                    .iter()
+                    .rev()
+                    .skip_while(|cluster| cluster.info.whitespace() == Whitespace::Newline)
+                    .take_while(|cluster| cluster.info.whitespace().is_space_or_nbsp())
+                    .fold((0.0_f32, 0_usize), |(adv, n), cluster| (adv + cluster.advance, n + 1))
             })
-            .unwrap_or(0.0);
+            .unwrap_or((0.0, 0));
+        line.metrics.trailing_whitespace = trailing_ws_advance;
+        line.trailing_space_count = trailing_ws_count;
 
         if !have_metrics {
             // Line consisting entirely of whitespace?
@@ -1147,6 +1163,55 @@ impl<'a, B: Brush> BreakLines<'a, B> {
 
         line.metrics.inline_min_coord = self.state.line_x;
         line.metrics.inline_max_coord = self.state.line_x + self.state.line_max_advance;
+    }
+
+    /// Returns `true` if there is visible (non-whitespace) content between `from_cluster` and
+    /// the next forced break (or end of text).
+    ///
+    /// This distinguishes mid-paragraph trailing whitespace (which is unconditionally hung per
+    /// CSS Text 3 §4.1.3) from paragraph-final trailing whitespace (conditionally hung).
+    /// When this returns `false`, the line breaker suppresses the soft wrap so the trailing
+    /// spaces accumulate on the current line for conditional hanging during alignment.
+    fn has_visible_content_before_forced_break(
+        &self,
+        from_cluster: usize,
+        current_item_idx: usize,
+        current_run_cluster_end: usize,
+    ) -> bool {
+        let items = &self.layout.data.items;
+        let clusters = &self.layout.data.clusters;
+
+        // Check remaining clusters in the current text run
+        for cluster in &clusters[from_cluster..current_run_cluster_end] {
+            let ws = cluster.info.whitespace();
+            if ws == Whitespace::Newline {
+                return false;
+            }
+            if !ws.is_space_or_nbsp() {
+                return true;
+            }
+        }
+
+        // Check subsequent items
+        for item in &items[(current_item_idx + 1)..] {
+            match item.kind {
+                LayoutItemKind::InlineBox => return true,
+                LayoutItemKind::TextRun => {
+                    let run_data = &self.layout.data.runs[item.index];
+                    for cluster in &clusters[run_data.cluster_range.clone()] {
+                        let ws = cluster.info.whitespace();
+                        if ws == Whitespace::Newline {
+                            return false;
+                        }
+                        if !ws.is_space_or_nbsp() {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+
+        false // Reached end of text, no visible content
     }
 }
 
@@ -1365,26 +1430,12 @@ fn try_commit_line<B: Brush>(
     //     return false;
     // }
 
-    // Exclude the trailing space from justification space count.
-    // Only subtract if the line actually ends with a space — with
-    // WordBreak::BreakAll, regular breaks can land between non-space
-    // characters, in which case there is no trailing space to exclude.
-    let mut num_spaces = state.num_spaces;
-    if break_reason == BreakReason::Regular
-        && state.clusters.start < state.clusters.end
-        && layout.data.clusters[state.clusters.end - 1]
-            .info
-            .whitespace()
-            .is_space_or_nbsp()
-    {
-        num_spaces = num_spaces.saturating_sub(1);
-    }
-
     lines.lines.push(LineData {
         item_range: start_item_idx..end_item_idx,
         max_advance,
         break_reason,
-        num_spaces,
+        total_spaces: state.num_spaces,
+        trailing_space_count: 0, // computed later in start_new_line
         indent: line_indent,
         metrics: LineMetrics {
             advance: state.x,
