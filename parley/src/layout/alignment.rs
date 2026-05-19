@@ -104,12 +104,10 @@ fn align_impl<B: Brush, const UNDO_JUSTIFICATION: bool>(
     for line in &mut layout.lines {
         let indent = line.indent;
 
-        // Hanging whitespace is an alignment/positioning concern, orthogonal to text
-        // directionality. The RTL handling here doesn't interact with bidi reordering:
-        // it simply shifts the line's origin so that hung trailing whitespace (which
-        // sits at the *start* edge in visual order for RTL) overflows into the start
-        // margin rather than displacing visible content.
         if is_rtl {
+            // In RTL text, trailing whitespace is on the left. As we hang that whitespace, offset
+            // the line to the left. Note: indent is not subtracted here because `free_space` below
+            // already accounts for it.
             line.metrics.offset = -line.metrics.trailing_whitespace;
         } else {
             line.metrics.offset = indent;
