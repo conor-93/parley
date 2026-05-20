@@ -644,48 +644,19 @@ impl<'a, B: Brush> BreakLines<'a, B> {
                         else {
                             // Case: cluster is a space character (and wrapping is enabled)
                             //
-                            // We hang any overflowing whitespace and then line-break.
+                            // Hang the overflowing whitespace by appending it to the current
+                            // line and continuing without committing a line break.
+                            //
+                            // The space is allowed to overflow; the actual break will occur when
+                            // the next non-space character triggers a break opportunity.
+                            // Multiple, consecutive trailing spaces are hanged with this approach.
                             if is_space && text_wrap_mode == TextWrapMode::Wrap {
                                 if max_height_exceeded {
                                     return self.max_height_break_data(line_height);
                                 }
                                 self.state.append_cluster_to_line(next_x, line_height);
                                 self.state.line.num_spaces += 1;
-
-                                // Consume all remaining consecutive trailing spaces so they
-                                // hang together on this line.
-                                while self.state.cluster_idx + 1 < cluster_end {
-                                    let next_cluster = run
-                                        .get(self.state.cluster_idx + 1 - cluster_start)
-                                        .unwrap();
-                                    if !next_cluster.info().whitespace().is_space_or_nbsp() {
-                                        break;
-                                    }
-                                    self.state.cluster_idx += 1;
-                                    let adv =
-                                        self.state.line.x + next_cluster.advance();
-                                    self.state.append_cluster_to_line(adv, line_height);
-                                    self.state.line.num_spaces += 1;
-                                }
-
-                                // CSS conditional hanging: trailing whitespace before a forced
-                                // break (or end of text) should not cause line wrapping. Only
-                                // wrap if there is visible content before the next forced break.
-                                if self.has_visible_content_before_forced_break(
-                                    self.state.cluster_idx + 1,
-                                    self.state.item_idx,
-                                    cluster_end,
-                                ) {
-                                    // Mid-paragraph: hang overflowing whitespace and wrap
-                                    if try_commit_line!(BreakReason::Regular) {
-                                        // TODO: can this be hoisted out of the conditional?
-                                        self.state.cluster_idx += 1;
-                                        return self.start_new_line(BreakReason::Regular);
-                                    }
-                                } else {
-                                    // Paragraph-final: accumulate space without wrapping
-                                    self.state.cluster_idx += 1;
-                                }
+                                self.state.cluster_idx += 1;
                             }
                             // Case: we have previously encountered a REGULAR line-breaking opportunity in the current line
                             //
@@ -1182,54 +1153,6 @@ impl<'a, B: Brush> BreakLines<'a, B> {
         line.metrics.inline_max_coord = self.state.line_x + self.state.line_max_advance;
     }
 
-    /// Returns `true` if there is visible (non-whitespace) content between `from_cluster` and
-    /// the next forced break (or end of text).
-    ///
-    /// This distinguishes mid-paragraph trailing whitespace (which is unconditionally hung per
-    /// CSS Text 3 §4.1.3) from paragraph-final trailing whitespace (conditionally hung).
-    /// When this returns `false`, the line breaker suppresses the soft wrap so the trailing
-    /// spaces accumulate on the current line for conditional hanging during alignment.
-    fn has_visible_content_before_forced_break(
-        &self,
-        from_cluster: usize,
-        current_item_idx: usize,
-        current_run_cluster_end: usize,
-    ) -> bool {
-        let items = &self.layout.data.items;
-        let clusters = &self.layout.data.clusters;
-
-        // Check remaining clusters in the current text run
-        for cluster in &clusters[from_cluster..current_run_cluster_end] {
-            let ws = cluster.info.whitespace();
-            if ws == Whitespace::Newline {
-                return false;
-            }
-            if !ws.is_space_or_nbsp() {
-                return true;
-            }
-        }
-
-        // Check subsequent items
-        for item in &items[(current_item_idx + 1)..] {
-            match item.kind {
-                LayoutItemKind::InlineBox => return true,
-                LayoutItemKind::TextRun => {
-                    let run_data = &self.layout.data.runs[item.index];
-                    for cluster in &clusters[run_data.cluster_range.clone()] {
-                        let ws = cluster.info.whitespace();
-                        if ws == Whitespace::Newline {
-                            return false;
-                        }
-                        if !ws.is_space_or_nbsp() {
-                            return true;
-                        }
-                    }
-                }
-            }
-        }
-
-        false // Reached end of text, no visible content
-    }
 }
 
 impl<B: Brush> Drop for BreakLines<'_, B> {
