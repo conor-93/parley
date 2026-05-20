@@ -854,6 +854,30 @@ fn hanging_whitespace_multi_paragraph() {
     env.check_layout_snapshot(&layout);
 }
 
+/// When multiple consecutive spaces overflow the line width mid-paragraph,
+/// ALL of them should hang on the current line (not just the first overflowing one).
+/// Line 2 should start with the visible content, not leftover spaces.
+#[test]
+fn hanging_whitespace_consumes_all_trailing_spaces() {
+    let mut env = TestEnv::new(test_name!(), Size::new(200.0, 350.0));
+
+    // Use a large font so that "A" + a few spaces overflow quickly.
+    // At 100px font size, "A" is ~60px and each space is ~25px in Roboto.
+    // With max_advance=100, "A " fits (~85px) but "A  " overflows (~110px).
+    // Text: "A   B\n" — three spaces between A and B.
+    // Expected: Line 1 = "A   " (all spaces hung), Line 2 = "B\n"
+    let text = "A   B\n";
+    let mut builder = env.tree_builder();
+    builder.set_white_space_mode(WhiteSpaceCollapse::Preserve);
+    builder.push_style_modification_span(&[StyleProperty::FontSize(100.0)]);
+    builder.push_text(text);
+    let (mut layout, _) = builder.build();
+    layout.break_all_lines(Some(100.0));
+    layout.align(Alignment::Start, AlignmentOptions::default());
+
+    env.check_layout_snapshot(&layout);
+}
+
 #[test]
 fn layout_impl_send_sync() {
     fn assert_send_sync<T: Send + Sync>() {}

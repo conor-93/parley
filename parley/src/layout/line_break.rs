@@ -651,6 +651,23 @@ impl<'a, B: Brush> BreakLines<'a, B> {
                                 }
                                 self.state.append_cluster_to_line(next_x, line_height);
                                 self.state.line.num_spaces += 1;
+
+                                // Consume all remaining consecutive trailing spaces so they
+                                // hang together on this line.
+                                while self.state.cluster_idx + 1 < cluster_end {
+                                    let next_cluster = run
+                                        .get(self.state.cluster_idx + 1 - cluster_start)
+                                        .unwrap();
+                                    if !next_cluster.info().whitespace().is_space_or_nbsp() {
+                                        break;
+                                    }
+                                    self.state.cluster_idx += 1;
+                                    let adv =
+                                        self.state.line.x + next_cluster.advance();
+                                    self.state.append_cluster_to_line(adv, line_height);
+                                    self.state.line.num_spaces += 1;
+                                }
+
                                 // CSS conditional hanging: trailing whitespace before a forced
                                 // break (or end of text) should not cause line wrapping. Only
                                 // wrap if there is visible content before the next forced break.
