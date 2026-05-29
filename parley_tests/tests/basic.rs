@@ -661,6 +661,223 @@ fn realign_all() {
     }
 }
 
+
+/// Tests that trailing whitespace on paragraph-final lines is included in alignment
+/// (CSS conditional hanging). For End alignment, trailing whitespace that
+/// fits within the paragraph width pushes visible text toward the start margin.
+#[test]
+fn hanging_whitespace_paragraph_final_end() {
+    let mut env = TestEnv::new(test_name!(), Size::new(200.0, 50.0));
+
+    // Paragraph-final line: trailing whitespace fits → included in alignment,
+    // pushing "Hello" toward the left.
+    {
+        let mut builder = env.tree_builder();
+        builder.set_white_space_mode(WhiteSpaceCollapse::Preserve);
+        builder.push_text("Hello          \n");
+        let (mut layout, _) = builder.build();
+        layout.break_all_lines(Some(200.0));
+        layout.align(Alignment::End, AlignmentOptions::default());
+        env.with_name("fits").check_layout_snapshot(&layout);
+    }
+
+    // Paragraph-final line: trailing whitespace overflows → free_space clamped to 0,
+    // visible text pinned at the start margin.
+    {
+        let mut builder = env.tree_builder();
+        builder.set_white_space_mode(WhiteSpaceCollapse::Preserve);
+        builder.push_text("Hello                                                                 \n");
+        let (mut layout, _) = builder.build();
+        layout.break_all_lines(Some(200.0));
+        layout.align(Alignment::End, AlignmentOptions::default());
+        env.with_name("overflows").check_layout_snapshot(&layout);
+    }
+}
+
+/// Same as above but for Center alignment.
+#[test]
+fn hanging_whitespace_paragraph_final_center() {
+    let mut env = TestEnv::new(test_name!(), Size::new(200.0, 50.0));
+
+    // Trailing whitespace fits → shifts visible content toward start.
+    {
+        let mut builder = env.tree_builder();
+        builder.set_white_space_mode(WhiteSpaceCollapse::Preserve);
+        builder.push_text("Hello          \n");
+        let (mut layout, _) = builder.build();
+        layout.break_all_lines(Some(200.0));
+        layout.align(Alignment::Center, AlignmentOptions::default());
+        env.with_name("fits").check_layout_snapshot(&layout);
+    }
+
+    // Trailing whitespace overflows → visible text pinned at start.
+    {
+        let mut builder = env.tree_builder();
+        builder.set_white_space_mode(WhiteSpaceCollapse::Preserve);
+        builder.push_text("Hello                                                                 \n");
+        let (mut layout, _) = builder.build();
+        layout.break_all_lines(Some(200.0));
+        layout.align(Alignment::Center, AlignmentOptions::default());
+        env.with_name("overflows").check_layout_snapshot(&layout);
+    }
+}
+
+/// Tests that trailing whitespace on mid-paragraph (soft-wrapped) lines is unconditionally
+/// hung — excluded from alignment width for End and Center alignment.
+#[test]
+fn hanging_whitespace_mid_paragraph_end() {
+    let mut env = TestEnv::new(test_name!(), Size::new(200.0, 60.0));
+
+    // Two words separated by lots of whitespace, forced to wrap.
+    // The first line's trailing whitespace should be hung (ignored for alignment),
+    // so "Hello" should be End-aligned as if it has no trailing whitespace.
+    let mut builder = env.tree_builder();
+    builder.set_white_space_mode(WhiteSpaceCollapse::Preserve);
+    builder.push_text("Hello                                    world\n");
+    let (mut layout, _) = builder.build();
+    layout.break_all_lines(Some(200.0));
+    layout.align(Alignment::End, AlignmentOptions::default());
+    env.check_layout_snapshot(&layout);
+}
+
+/// Same as above but for Center alignment.
+#[test]
+fn hanging_whitespace_mid_paragraph_center() {
+    let mut env = TestEnv::new(test_name!(), Size::new(200.0, 60.0));
+
+    let mut builder = env.tree_builder();
+    builder.set_white_space_mode(WhiteSpaceCollapse::Preserve);
+    builder.push_text("Hello                                    world\n");
+    let (mut layout, _) = builder.build();
+    layout.break_all_lines(Some(200.0));
+    layout.align(Alignment::Center, AlignmentOptions::default());
+    env.check_layout_snapshot(&layout);
+}
+
+/// Tests justified alignment with trailing whitespace on non-final lines.
+/// Trailing whitespace spaces should NOT participate in justification distribution;
+/// only inter-word spaces in visible content should be expanded.
+#[test]
+fn hanging_whitespace_justify_mid_paragraph() {
+    let mut env = TestEnv::new(test_name!(), Size::new(200.0, 60.0));
+
+    // "Hello world" followed by lots of trailing whitespace, then "foo" on next line.
+    // The trailing whitespace on line 1 should be hung, and justification should only
+    // distribute free_space across the single inter-word space between "Hello" and "world".
+    let mut builder = env.tree_builder();
+    builder.set_white_space_mode(WhiteSpaceCollapse::Preserve);
+    builder.push_text("Hello world                              foo\n");
+    let (mut layout, _) = builder.build();
+    layout.break_all_lines(Some(200.0));
+    layout.align(Alignment::Justify, AlignmentOptions::default());
+    env.check_layout_snapshot(&layout);
+}
+
+/// Tests that justify on paragraph-final lines falls back to Start alignment
+/// (per CSS spec: last line of a justified paragraph is start-aligned).
+/// Trailing whitespace on the final line should still be included per conditional hanging.
+#[test]
+fn hanging_whitespace_justify_paragraph_final() {
+    let mut env = TestEnv::new(test_name!(), Size::new(200.0, 60.0));
+
+    // Multi-line: first line justified, last line start-aligned with trailing ws included.
+    let mut builder = env.tree_builder();
+    builder.set_white_space_mode(WhiteSpaceCollapse::Preserve);
+    builder.push_text("Hello world                              foo      \n");
+    let (mut layout, _) = builder.build();
+    layout.break_all_lines(Some(200.0));
+    layout.align(Alignment::Justify, AlignmentOptions::default());
+    env.check_layout_snapshot(&layout);
+}
+
+/// Tests trailing whitespace behaviour on the very last line (BreakReason::None)
+/// which is the end-of-text case rather than an explicit newline.
+#[test]
+fn hanging_whitespace_end_of_text() {
+    let mut env = TestEnv::new(test_name!(), Size::new(200.0, 50.0));
+
+    for (alignment, name) in [
+        (Alignment::End, "end"),
+        (Alignment::Center, "center"),
+    ] {
+        // No trailing \n — the line ends due to running out of text (BreakReason::None).
+        // Trailing whitespace should still be conditionally included.
+        let mut builder = env.tree_builder();
+        builder.set_white_space_mode(WhiteSpaceCollapse::Preserve);
+        builder.push_text("Hello          ");
+        let (mut layout, _) = builder.build();
+        layout.break_all_lines(Some(200.0));
+        layout.align(alignment, AlignmentOptions::default());
+        env.with_name(name).check_layout_snapshot(&layout);
+    }
+}
+
+/// Tests the line-breaker behaviour: trailing whitespace before a forced newline
+/// should NOT cause a soft wrap, even if it overflows the line width.
+/// The whitespace should accumulate on the same line as the preceding text.
+#[test]
+fn no_wrap_on_trailing_whitespace_before_newline() {
+    let mut env = TestEnv::new(test_name!(), Size::new(200.0, 50.0));
+
+    // Enough trailing whitespace to overflow the 200px line width, followed by \n.
+    // Should produce exactly 2 lines: "Hello...spaces...\n" and "" (empty final line).
+    let mut builder = env.tree_builder();
+    builder.set_white_space_mode(WhiteSpaceCollapse::Preserve);
+    builder.push_text("Hello                                                                 \n");
+    let (mut layout, _) = builder.build();
+    layout.break_all_lines(Some(200.0));
+    layout.align(Alignment::Start, AlignmentOptions::default());
+
+    assert_eq!(
+        layout.len(),
+        2,
+        "Trailing whitespace before \\n should not cause an extra line wrap"
+    );
+    env.check_layout_snapshot(&layout);
+}
+
+/// Tests multi-paragraph handling: each paragraph has different trailing whitespace,
+/// and alignment is applied consistently per the paragraph-final vs mid-paragraph rules.
+#[test]
+fn hanging_whitespace_multi_paragraph() {
+    let mut env = TestEnv::new(test_name!(), Size::new(200.0, 80.0));
+
+    // Two paragraphs: first ends with \n (Explicit), second ends at end-of-text (None).
+    // Both final lines should get conditional hanging. The soft-wrapped mid-paragraph
+    // line gets unconditional hanging.
+    let mut builder = env.tree_builder();
+    builder.set_white_space_mode(WhiteSpaceCollapse::Preserve);
+    builder.push_text("Hello world                              end of para one     \nSecond paragraph   ");
+    let (mut layout, _) = builder.build();
+    layout.break_all_lines(Some(200.0));
+    layout.align(Alignment::End, AlignmentOptions::default());
+    env.check_layout_snapshot(&layout);
+}
+
+/// When multiple consecutive spaces overflow the line width mid-paragraph,
+/// ALL of them should hang on the current line (not just the first overflowing one).
+/// Line 2 should start with the visible content, not leftover spaces.
+#[test]
+fn hanging_whitespace_consumes_all_trailing_spaces() {
+    let mut env = TestEnv::new(test_name!(), Size::new(200.0, 350.0));
+
+    // Use a large font so that "A" + a few spaces overflow quickly.
+    // At 100px font size, "A" is ~60px and each space is ~25px in Roboto.
+    // With max_advance=100, "A " fits (~85px) but "A  " overflows (~110px).
+    // Text: "A   B\n" — three spaces between A and B.
+    // Expected: Line 1 = "A   " (all spaces hung), Line 2 = "B\n"
+    let text = "A   B\n";
+    let mut builder = env.tree_builder();
+    builder.set_white_space_mode(WhiteSpaceCollapse::Preserve);
+    builder.push_style_modification_span(&[StyleProperty::FontSize(100.0)]);
+    builder.push_text(text);
+    let (mut layout, _) = builder.build();
+    layout.break_all_lines(Some(100.0));
+    layout.align(Alignment::Start, AlignmentOptions::default());
+
+    env.check_layout_snapshot(&layout);
+}
+
 #[test]
 fn layout_impl_send_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
