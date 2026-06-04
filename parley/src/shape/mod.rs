@@ -251,8 +251,6 @@ fn fill_cluster_in_place(
         //  regional indicators, subdivision flag tag sequences, skin tone modifiers
         //  See also: https://github.com/google/emoji-segmenter
 
-        // ======== DISABLED: START ========
-
         // If the color emoji has a non-printing variation selector, ignore the variation selector.
         // Its presentation depends on the platform and font.
         //
@@ -261,15 +259,11 @@ fn fill_cluster_in_place(
         //  - `U+270C + U+FE0F`: `✌️`, force emoji presentation
         //
         // <https://www.unicode.org/reports/tr37/>
-        /*let is_emoji_with_non_printing_variation_selector =
+        let is_emoji_with_non_printing_variation_selector =
             is_emoji_or_pictograph && info.is_variation_selector();
 
         let contributes_to_shaping =
-            info.contributes_to_shaping(); && !is_emoji_with_non_printing_variation_selector;*/
-
-        // ======== DISABLED: END ========
-
-        let contributes_to_shaping = info.contributes_to_shaping();
+            info.contributes_to_shaping() && !is_emoji_with_non_printing_variation_selector;
         if contributes_to_shaping {
             map_len += 1;
         }
