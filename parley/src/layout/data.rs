@@ -166,8 +166,14 @@ pub(crate) struct LineData {
     pub(crate) break_reason: BreakReason,
     /// Maximum advance for the line.
     pub(crate) max_advance: f32,
-    /// Number of justified clusters on the line.
-    pub(crate) num_spaces: usize,
+    /// Total number of space/nbsp clusters on the line.
+    pub(crate) total_spaces: usize,
+    /// Number of trailing space/nbsp clusters that are hung rather than justified.
+    ///
+    /// Per CSS Text 3 §4.1.3 (`white-space` processing, phase 2): trailing preserved spaces
+    /// are either unconditionally hung (soft-wrapped lines) or conditionally hung (forced
+    /// breaks / end of block). In both cases they are excluded from justification distribution.
+    pub(crate) trailing_space_count: usize,
     /// Text indent applied to this line.
     pub(crate) indent: f32,
 }
